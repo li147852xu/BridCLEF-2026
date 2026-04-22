@@ -24,6 +24,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
+# AutoDL china region: enable HF proxy so the final push actually reaches HF.
+if [[ -f /etc/network_turbo ]]; then
+  # shellcheck disable=SC1091
+  source /etc/network_turbo
+fi
+
 if [[ -z "${HF_TOKEN:-}" ]]; then
   echo "ERROR: HF_TOKEN not set — cannot back up. Set it and re-run." >&2
   exit 3

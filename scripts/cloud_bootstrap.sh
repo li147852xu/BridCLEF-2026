@@ -55,6 +55,15 @@ echo "==============================================================="
 
 mkdir -p "$WORK_ROOT"/{data,weights,cache,checkpoints,export,logs,.flags}
 
+# AutoDL china regions block huggingface.co direct; source the built-in
+# network turbo which sets http_proxy to the in-cluster HF/GitHub relay.
+# Harmless no-op on other hosts / regions.
+if [[ -f /etc/network_turbo ]]; then
+  # shellcheck disable=SC1091
+  source /etc/network_turbo
+  echo "[net] AutoDL network_turbo active (http_proxy=$http_proxy)"
+fi
+
 # -------- 1. Python deps ----------------------------------------------------
 echo "[1/6] installing Python deps (this may take a few minutes)..."
 python3 -m pip install --quiet --upgrade pip
