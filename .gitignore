@@ -1,0 +1,64 @@
+# Data and large artifacts
+data/
+artifacts/
+models/perch_v2_cpu/
+*.npy
+*.npz
+*.pkl
+*.parquet
+*.h5
+*.csv
+!configs/*.csv
+
+# Kaggle
+/kaggle_submit/*.ipynb_checkpoints/
+kernel-metadata.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+.python-version
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Cursor
+.cursor/
+
+# Claude Code user-local settings
+.claude/
+
+# Jupyter
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# Logs
+*.log
+logs/
+
+# ONNX model files (shipped via Kaggle dataset, not git)
+*.onnx
+*.pt
+
+# Cloud pipeline working tree (everything under work_root; never committed)
+/data/
+/weights/
+/cache/
+/checkpoints/
+/export/
+/.flags/
+/autodl-tmp/
+
+# Secrets
+.kaggle/
+kaggle.json
+.env.local
+*.token
+

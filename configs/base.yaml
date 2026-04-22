@@ -1,0 +1,100 @@
+# BirdCLEF+ 2026 — global configuration
+# Read by common/paths.py and all scripts.
+
+paths:
+  comp_dir: data/birdclef-2026           # competition data (directory or symlink)
+  perch_model: models/perch_v2_cpu/1     # Perch v2 SavedModel dir
+  artifacts_dir: artifacts               # per-stage outputs (gitignored)
+  perch_cache_dir: artifacts/perch_cache # Perch embedding + logit cache
+
+  # Kaggle runtime overrides (used when /kaggle/input exists)
+  kaggle:
+    comp_dir: /kaggle/input/birdclef-2026
+    perch_model: /kaggle/input/models/google/bird-vocalization-classifier/tensorflow2/perch_v2_cpu/1
+    # The submission notebook loads this bundle from a private Kaggle dataset
+    bundle: /kaggle/input/birdclef-2026-bundle/submission_bundle.pkl
+
+audio:
+  sample_rate: 32000
+  window_seconds: 5
+  file_seconds: 60
+  windows_per_file: 12          # 60 / 5
+
+# Perch v2 emits 1536-dim embeddings and ~10932-class logits
+perch:
+  embedding_dim: 1536
+  labels_csv_name: labels.csv
+  labels_name_col: inat2024_fsd50k
+
+# Feature / probe config
+features:
+  pca_dim: 128
+  temporal_stats: [mean, max, std, delta]   # for the "temporal-lite" head
+  seq_stats_extra: [p90]                    # optional additional per-window pooling
+
+probe:
+  type: logreg                  # one of: logreg, lightgbm
+  logreg:
+    C: 1.0
+    max_iter: 300
+    solver: liblinear
+    class_weight: balanced
+  lightgbm:
+    num_leaves: 31
+    learning_rate: 0.05
+    n_estimators: 300
+    min_data_in_leaf: 20
+
+# Teacher fusion weights (match legacy defaults; will be refit later)
+teacher_fusion:
+  alpha_perch: 0.60
+  alpha_prior: 0.15
+  alpha_probe: 0.10
+  alpha_temp:  0.15
+
+# Pseudo-labeling rounds (monotonically widening)
+pseudo:
+  rounds:
+    - {name: very_strict, pos_thr: 0.99, neg_thr: 0.01, file_thr: 0.99}
+    - {name: strict,      pos_thr: 0.98, neg_thr: 0.02, file_thr: 0.98}
+    - {name: balanced,    pos_thr: 0.95, neg_thr: 0.05, file_thr: 0.95}
+  # Default selected round for single-shot pipeline
+  default: strict
+
+# Student model
+student:
+  type: mlp                     # one of: ridge, mlp, lightgbm
+  mlp:
+    hidden: [512, 256]
+    dropout: 0.2
+    lr: 1.0e-3
+    weight_decay: 1.0e-4
+    batch_size: 256
+    epochs: 40
+    mixup_alpha: 0.4
+    label_smoothing: 0.05
+    device: mps                 # auto-fallback to cpu
+  ridge:
+    alpha: 1.0
+
+# Post-processing
+postprocess:
+  topn: 1                       # TopN=1 multiplicative smoothing (2025 2nd-place magic)
+  isotonic: true                # per-class isotonic calibration
+  rank_transform: false         # enable for ensemble stage
+
+# Cross-validation for priors / probes
+cv:
+  n_folds: 5
+  by: site                      # one of: site, file, random
+  seed: 42
+
+# Proxy logic (Amphibia / Insecta / unmapped Aves) — copied from legacy
+proxy:
+  reduce: max
+  taxa_allowed: [Amphibia, Insecta, Aves]
+
+misc:
+  seed: 42
+  num_workers_io: 4
+  perch_batch_files: 64         # 16 GB RAM can handle; drop to 24 if OOM

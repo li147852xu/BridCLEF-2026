@@ -1,0 +1,182 @@
+# BirdCLEF+ 2026 — Plan Y (cloud, single backbone + 1 pseudo iter)
+# Target PB: 0.90–0.92 | ~35h on RTX 4090.
+#
+# All paths are **absolute on the cloud box** (AutoDL default layout).
+# Override per-run with env BIRDCLEF_WORK_ROOT if needed.
+
+plan: Y
+backbones:
+  - name: eca_nfnet_l0
+    lr: 5.0e-4
+    batch_size: 64           # 4090 24GB; drop to 48 if OOM
+    epochs_ft: 18
+    epochs_ft_iter: 12
+    head_dropout: 0.2
+
+paths:
+  work_root: /root/autodl-tmp/bridclef        # big data disk on AutoDL
+  repo_root: /root/BridCLEF-2026
+
+  # -- inputs (downloaded by cloud_bootstrap.sh; read-only after) -----------
+  comp_dir:      ${paths.work_root}/data/birdclef-2026
+  perch_model:   ${paths.work_root}/weights/perch_v2_cpu/1
+  pretrain_dir:  ${paths.work_root}/weights/birdclef_2025_pretrained   # Sydorskyy 2025 dataset
+
+  # -- generated artifacts (per-stage, idempotent) --------------------------
+  mel_cache:     ${paths.work_root}/cache/mel                     # S2 output
+  perch_cache:   ${paths.work_root}/cache/perch                   # S3 output
+  ckpt_root:     ${paths.work_root}/checkpoints                   # S5/S7 output
+  export_dir:    ${paths.work_root}/export                        # S9 output (OpenVINO)
+  logs_dir:      ${paths.work_root}/logs
+
+  # -- done flags (one file per completed stage) ---------------------------
+  flags_dir:     ${paths.work_root}/.flags
+
+# --- audio / mel spec (shared by S2, S5, S7, S9) ----------------------------
+audio:
+  sample_rate: 32000
+  window_seconds: 5
+  file_seconds: 60
+  windows_per_file: 12
+
+mel:
+  n_fft: 1024
+  hop_length: 512
+  win_length: 1024
+  n_mels: 128
+  f_min: 50
+  f_max: 16000
+  power: 2.0
+  normalized: false
+  # at load time we convert to dB with a fixed clamp then quantize to uint8
+  db_clip:  [-80.0, 0.0]
+
+# --- S2: mel cache ----------------------------------------------------------
+# Disk budget on the 5090 box is tight (50 GB data disk) so we only cache
+# the soundscapes here. ``train_audio`` is variable-length and huge; we
+# decode + mel-transform on the fly in S5's DataLoader instead (one ogg
+# decode is ~15 ms, negligible once prefetch + num_workers kicks in).
+s2:
+  sources:
+    - name: train_soundscapes   # 23-site, 60s files, used for Perch + supervised windows
+      glob: train_soundscapes/*.ogg
+  num_workers: 8
+  # One npz per source file: (n_windows, n_mels, frames) uint8 + meta.
+  # Idempotent: skip if output exists with matching n_windows.
+
+# --- S3: Perch v2 teacher pseudo-label --------------------------------------
+s3:
+  # Run Perch on every 5s window of train_soundscapes; store sigmoid probs
+  # (fp16) for the 234 primary_labels via direct + genus-proxy mapping.
+  input_source: train_soundscapes
+  batch_files: 32              # how many 60s files Perch processes at once
+  # Perch v2 ships as TF 2.20 SavedModel without sm_120 kernels, so we run
+  # it on CPU by default (AutoDL 5090 hosts ship with 16+ core Xeons — still
+  # 3-4x faster than the Mac baseline). Flip to ``cuda`` only if you've
+  # independently verified TF 2.20 can execute on the 5090.
+  device: cpu
+  output_shards: 4             # split probs into shards for safer resume
+  # Checkpoint every N files; on resume we pick up from last-complete shard.
+  ckpt_every_files: 50
+
+# --- S5: fine-tune on competition data (5-fold GroupKFold by site) ---------
+s5:
+  n_folds: 5
+  fold_by: site                # 23 sites → site-shift-aware CV
+  data_mix:
+    train_audio:
+      weight: 1.0
+      label: weak              # primary_label as hard positive, secondary_labels softened
+      secondary_soft: 0.3
+    train_soundscapes_labels:  # 708 hard rows, per-window
+      weight: 3.0
+      label: hard
+  loss:
+    type: focal_bce
+    gamma: 2.0
+    label_smoothing: 0.02
+  augment:
+    spec_augment:
+      freq_masks: 2
+      freq_mask_param: 16
+      time_masks: 2
+      time_mask_param: 40
+    mixup_alpha: 0.4
+    mixup_prob: 0.5
+    cutmix_prob: 0.3
+    time_shift_max_s: 1.0
+  optimizer:
+    name: adamw
+    weight_decay: 1.0e-2
+  scheduler:
+    name: cosine
+    warmup_epochs: 2
+  ema_decay: 0.9995
+  swa:
+    enable: true
+    last_epochs: 5
+  save_every_steps: 500
+  eval_every_epochs: 1
+  amp: true
+
+# --- S6: iter-1 pseudo inference on all train_soundscapes ------------------
+s6:
+  tta:
+    - {shift_s: 0.0}
+    - {shift_s: -1.5}
+    - {shift_s:  1.5}
+  pos_threshold: 0.90
+  neg_threshold: 0.05
+  # rows with all-mid confidence are dropped (no label)
+  save_format: sparse_npz
+
+# --- S7: fine-tune with iter-1 pseudo + comp data --------------------------
+s7:
+  inherit: s5
+  data_mix:
+    train_audio:
+      weight: 1.0
+      label: weak
+      secondary_soft: 0.3
+    train_soundscapes_labels:
+      weight: 3.0
+      label: hard
+    pseudo_iter1:
+      weight: 1.0
+      label: pseudo            # soft target but thresholded
+  epochs_ft_iter: 12
+  lr_multiplier: 0.5           # lower LR on second pass
+
+# --- S9: export to OpenVINO fp16 -------------------------------------------
+s9:
+  precision: fp16
+  input_shape: [1, 160000]     # 1 window, 5s @ 32kHz
+  per_fold: true               # one .xml/.bin per fold
+  sanity_test: true
+
+# --- checkpointing / resume -------------------------------------------------
+checkpoint:
+  keep_last_n: 3
+  keep_best: true
+  atomic_write: true
+  save_rng: true
+  # Optional HF backup (requires HF_TOKEN env var). Repo is private; created
+  # once from the Mac via scripts/cloud_bootstrap.sh --create-hf-repo or via
+  # the HF web UI.
+  hf_backup:
+    enable: true
+    repo_id: "li147852xu/birdclef-2026-ckpts"
+    interval_min: 30
+    subdir_pattern: "{stage}/{fold}"
+
+# --- logging ---------------------------------------------------------------
+log:
+  level: INFO
+  jsonl: true          # metrics stream to {logs_dir}/{stage}.jsonl
+  tensorboard: true
+  console_every_steps: 50
+
+# --- misc ------------------------------------------------------------------
+misc:
+  seed: 20260422
+  deterministic: false      # keep cudnn benchmark on for throughput
