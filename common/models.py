@@ -38,17 +38,22 @@ class BirdCLEFModel(nn.Module):
     timm's ``num_classes=0`` gives the pooled feature vector. We add our own
     dropout + linear so the classifier layer's state-dict key stays stable
     (``head.0.weight`` / ``head.1.weight``) for resume + export.
+
+    ``pretrained_timm=True`` uses timm's ImageNet weights — adapted to 1-channel
+    input automatically by averaging the RGB stem kernel. We switch this on when
+    the caller couldn't match a domain-specific ckpt, so we never end up with a
+    purely random init (which would be 5 epochs behind).
     """
 
-    def __init__(self, cfg: ModelCfg):
+    def __init__(self, cfg: ModelCfg, pretrained_timm: bool = False):
         super().__init__()
         import timm
         self.cfg = cfg
         self.backbone = timm.create_model(
             cfg.backbone,
-            pretrained=False,          # we load Sydorskyy weights manually below
+            pretrained=pretrained_timm,
             in_chans=cfg.in_chans,
-            num_classes=0,             # emit pooled features
+            num_classes=0,
             drop_rate=cfg.drop_rate,
         )
         n_feat = int(self.backbone.num_features)
@@ -68,34 +73,55 @@ class BirdCLEFModel(nn.Module):
 # --------------------------------------------------------------------------
 
 def _try_load_pretrained(model: BirdCLEFModel, path: Path) -> tuple[int, int]:
-    """Load weights from ``path``, skipping head shape mismatches.
+    """Load weights from ``path``, skipping head / classifier mismatches.
 
-    Returns (loaded, skipped) counts for logging. Never raises — we log and
-    let training continue from random head init if the file is bad.
+    Returns ``(loaded, skipped)`` counts. Handles common ckpt quirks:
+        * lightning wrappers with ``state_dict`` or ``model`` top-level key
+        * common prefixes (``module.``, ``model.``, ``ema_model.``, ``backbone.``)
+        * source key names using underscores where timm uses dots
+          (e.g. Sydorskyy's NFNet: ``stem_conv1.weight`` -> ``stem.conv1.weight``)
+
+    Never raises — a failed/empty load lets the caller fall back to timm
+    ImageNet init instead of random init.
     """
     state = torch.load(str(path), map_location="cpu", weights_only=False)
-    if isinstance(state, dict) and "state_dict" in state:
-        state = state["state_dict"]
+    if isinstance(state, dict):
+        if "state_dict" in state and isinstance(state["state_dict"], dict):
+            state = state["state_dict"]
+        elif "model" in state and isinstance(state["model"], dict) and all(
+            hasattr(v, "shape") for v in list(state["model"].values())[:3]
+        ):
+            state = state["model"]
+
     # Strip common prefixes.
-    stripped = {}
+    stripped: dict[str, "torch.Tensor"] = {}
     for k, v in state.items():
         nk = k
-        for pref in ("module.", "model.", "ema_model."):
+        for pref in ("module.", "model.", "ema_model.", "backbone."):
             if nk.startswith(pref):
                 nk = nk[len(pref):]
         stripped[nk] = v
-    # We want to load anything that goes into ``self.backbone.*``. Head is
-    # size-mismatched, drop it.
+
     target_sd = model.state_dict()
-    ok = {}
+
+    def candidate_names(k: str) -> list[str]:
+        # Generate plausible target names by toggling underscore/dot.
+        out = [k, f"backbone.{k}"]
+        parts = k.split("_", 1)
+        if len(parts) == 2:
+            dotted = parts[0] + "." + parts[1]
+            out += [dotted, f"backbone.{dotted}"]
+        # Also try converting every underscore in the first token.
+        if "_" in k:
+            dotted_full = k.replace("_", ".", 1)
+            out += [dotted_full, f"backbone.{dotted_full}"]
+        return out
+
+    ok: dict[str, "torch.Tensor"] = {}
     skipped = 0
     for k, v in stripped.items():
-        # Head tensors in the source can be named e.g. "classifier.weight" or
-        # "head.*"; we don't map those. If there's a matching backbone key in
-        # our model with identical shape, include it.
-        candidates = [k, f"backbone.{k}"]
         hit = None
-        for cand in candidates:
+        for cand in candidate_names(k):
             if cand in target_sd and target_sd[cand].shape == v.shape:
                 hit = cand
                 break
@@ -103,21 +129,36 @@ def _try_load_pretrained(model: BirdCLEFModel, path: Path) -> tuple[int, int]:
             ok[hit] = v
         else:
             skipped += 1
-    missing, unexpected = model.load_state_dict(ok, strict=False)
-    loaded = len(ok)
-    return loaded, skipped
+    model.load_state_dict(ok, strict=False)
+    return len(ok), skipped
 
 
 def build_model(cfg: ModelCfg, logger=None) -> BirdCLEFModel:
-    model = BirdCLEFModel(cfg)
+    """Build a model; try domain ckpt first, fall back to timm ImageNet init
+    if that yields zero matched tensors (a bad match is worse than no match
+    and we don't want random init)."""
+    model = BirdCLEFModel(cfg, pretrained_timm=False)
+
+    loaded = 0
     if cfg.pretrained_path is not None and Path(cfg.pretrained_path).exists():
         loaded, skipped = _try_load_pretrained(model, Path(cfg.pretrained_path))
         if logger:
-            logger.info("pretrained: loaded %d tensors, skipped %d (head reset)",
-                        loaded, skipped)
+            logger.info("pretrained: loaded %d tensors, skipped %d from %s",
+                        loaded, skipped, cfg.pretrained_path)
     elif cfg.pretrained_path is not None and logger:
-        logger.warning("pretrained_path %s missing — training from scratch",
-                       cfg.pretrained_path)
+        logger.warning("pretrained_path %s missing", cfg.pretrained_path)
+
+    if loaded == 0:
+        if logger:
+            logger.info("pretrained: domain ckpt unusable, falling back to timm ImageNet init")
+        try:
+            model = BirdCLEFModel(cfg, pretrained_timm=True)
+            if logger:
+                logger.info("pretrained: timm ImageNet init loaded (in_chans=%d auto-adapted)",
+                            cfg.in_chans)
+        except Exception as e:  # noqa: BLE001
+            if logger:
+                logger.warning("timm ImageNet init failed (%s) — training from scratch", e)
     return model
 
 

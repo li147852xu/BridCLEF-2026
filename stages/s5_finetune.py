@@ -49,20 +49,25 @@ def _build_label_index(comp_dir: Path) -> tuple[list[str], dict[str, int]]:
 
 
 def _pick_pretrained(pretrain_dir: Path, backbone: str) -> Optional[Path]:
-    """Find a pretrained .pt in the Sydorskyy 2025 dataset matching the backbone."""
+    """Find a pretrained checkpoint in the Sydorskyy 2025 dataset matching ``backbone``.
+
+    Strict: returns ``None`` (not a random fallback) if no filename contains
+    the backbone token — otherwise we'd load an unrelated architecture's
+    weights and wreck init. Prefers files under ``models_2025/`` over
+    ``models_2024/`` since 2025 was trained with a similar task setup.
+    """
     if not pretrain_dir.exists():
         return None
-    # Loosely match: any file whose name contains the backbone key.
-    cand = list(pretrain_dir.rglob("*.pt")) + list(pretrain_dir.rglob("*.pth"))
+    cand: list[Path] = []
+    for ext in ("*.ckpt", "*.pt", "*.pth"):
+        cand.extend(pretrain_dir.rglob(ext))
     key = backbone.replace("_", "").lower()
-    best = None
-    for p in cand:
-        if key in p.stem.replace("_", "").lower():
-            best = p
-            break
-    if best is None and cand:
-        best = cand[0]
-    return best
+    matches = [p for p in cand if key in p.stem.replace("_", "").lower()]
+    if not matches:
+        return None
+    # Prefer 2025 models.
+    matches.sort(key=lambda p: (0 if "2025" in str(p) else 1, len(p.stem)))
+    return matches[0]
 
 
 def _build_datasets(
