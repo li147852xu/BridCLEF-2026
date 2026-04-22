@@ -121,7 +121,7 @@ s5:
   # 4 dataloader workers + single math thread each (worker_init_fn) keeps
   # total threads well under the kernel's implicit limit and preserves I/O
   # headroom on AutoDL's shared md0 datadisk.
-  num_workers: 4
+  num_workers: 2
 
 # --- S6: iter-1 pseudo inference on all train_soundscapes ------------------
 s6:

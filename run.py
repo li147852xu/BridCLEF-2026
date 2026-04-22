@@ -18,6 +18,15 @@ Design:
 
 from __future__ import annotations
 
+# IMPORTANT: Cap math-lib thread pools BEFORE any numpy/torch import.
+# AutoDL images ship OMP_NUM_THREADS=25 globally; combined with dataloader
+# workers this explodes to >500 threads and deadlocks I/O. Forcing 1 here is
+# inherited by every forked dataloader worker.
+import os as _os
+for _k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    _os.environ[_k] = "1"
+
 import argparse
 import sys
 import time
