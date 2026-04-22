@@ -183,21 +183,36 @@ class HFBackupDaemon:
     def _push_once(self) -> None:
         if not self.local_dir.exists():
             return
-        try:
-            cmd = [
-                "huggingface-cli", "upload",
-                self.repo_id,
-                str(self.local_dir),
-                self.remote_subdir,
-                "--repo-type", "model",
-                "--commit-message", f"auto-backup {time.strftime('%Y-%m-%d %H:%M:%S')}",
-            ]
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-            if r.returncode != 0:
-                self.log.warning("HF backup failed (rc=%d): %s",
-                                 r.returncode, r.stderr.strip()[:500])
-        except Exception as e:  # noqa: BLE001
-            self.log.warning("HF backup exception: %s", e)
+        # Newer huggingface_hub ships `hf` (>= 0.26); older installs have
+        # `huggingface-cli`. Try the new one first so we are not surprised
+        # by deprecation warnings that exit non-zero.
+        import shutil
+        for exe in ("hf", "huggingface-cli"):
+            if shutil.which(exe) is None:
+                continue
+            try:
+                if exe == "hf":
+                    cmd = [
+                        exe, "upload", self.repo_id,
+                        str(self.local_dir), self.remote_subdir,
+                        "--repo-type", "model",
+                        "--commit-message", f"auto-backup {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                    ]
+                else:
+                    cmd = [
+                        exe, "upload", self.repo_id,
+                        str(self.local_dir), self.remote_subdir,
+                        "--repo-type", "model",
+                        "--commit-message", f"auto-backup {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                    ]
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+                if r.returncode == 0:
+                    return
+                self.log.warning("HF backup (%s) failed rc=%d: %s",
+                                 exe, r.returncode, r.stderr.strip()[:400])
+            except Exception as e:  # noqa: BLE001
+                self.log.warning("HF backup (%s) exception: %s", exe, e)
+        self.log.warning("HF backup: no working CLI found on PATH.")
 
 
 # --------------------------------------------------------------------------

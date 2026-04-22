@@ -140,7 +140,14 @@ class TrainAudioDataset(Dataset):
         return len(self.df)
 
     def _decode(self, path: Path) -> np.ndarray:
-        """Read, downmix, pad/crop to 5s. Randomness applied here."""
+        """Read, downmix, pad/crop to 5s. Randomness applied here.
+
+        Invariant: return array has length exactly ``self.win_samples``.
+        We always fall through to pad/crop at the bottom — OGG headers
+        occasionally over-report frame counts, so even the partial-read
+        path can return fewer samples than requested.
+        """
+        y: np.ndarray
         with sf.SoundFile(str(path)) as fh:
             sr = fh.samplerate
             n = fh.frames
@@ -151,18 +158,21 @@ class TrainAudioDataset(Dataset):
                     y = y.mean(axis=1)
                 import resampy
                 y = resampy.resample(y, sr, self.mel_cfg.sr).astype(np.float32)
+            elif n > self.win_samples and self.train:
+                # Partial random read for long files. soundfile.read(n) may
+                # return fewer samples if the header over-reports, so we
+                # don't return early — pad/crop below normalises length.
+                start = int(np.random.randint(0, n - self.win_samples + 1))
+                fh.seek(start)
+                y = fh.read(self.win_samples, dtype="float32", always_2d=False)
+                if y.ndim == 2:
+                    y = y.mean(axis=1)
             else:
-                # partial random read for long files
-                if n > self.win_samples and self.train:
-                    start = int(np.random.randint(0, n - self.win_samples + 1))
-                    fh.seek(start)
-                    y = fh.read(self.win_samples, dtype="float32", always_2d=False)
-                    if y.ndim == 2: y = y.mean(axis=1)
-                    return y
                 y = fh.read(dtype="float32", always_2d=False)
-                if y.ndim == 2: y = y.mean(axis=1)
+                if y.ndim == 2:
+                    y = y.mean(axis=1)
 
-        # pad or center-crop to exactly 5s
+        # pad or center/random-crop to exactly win_samples
         if len(y) < self.win_samples:
             pad = self.win_samples - len(y)
             left = int(np.random.randint(0, pad + 1)) if self.train else 0
@@ -329,8 +339,28 @@ def build_val_dataset(labels_df: pd.DataFrame, mel_cache_dir: Path,
 # --------------------------------------------------------------------------
 
 def collate(batch):
+    """Collate that drops shape-outlier samples instead of crashing.
+
+    Belt-and-suspenders safety net: _decode guarantees a uniform waveform
+    length, but if some rare file slips through with a mel shape different
+    from the batch majority we drop the outliers and move on. Beats taking
+    down the whole fold over one bad file.
+    """
     import torch
-    mels = torch.from_numpy(np.stack([b[0] for b in batch]))
-    targets = torch.from_numpy(np.stack([b[1] for b in batch]))
-    weights = torch.from_numpy(np.array([b[2] for b in batch], dtype=np.float32))
+    if not batch:
+        raise ValueError("empty batch")
+    # Find the mode shape among b[0] entries.
+    from collections import Counter
+    shapes = Counter(tuple(b[0].shape) for b in batch)
+    target_shape = shapes.most_common(1)[0][0]
+    kept = [b for b in batch if tuple(b[0].shape) == target_shape]
+    if len(kept) < len(batch):
+        import logging as _log
+        _log.getLogger("bridclef.collate").warning(
+            "dropped %d/%d batch items with non-matching mel shape (target=%s, got=%s)",
+            len(batch) - len(kept), len(batch), target_shape, dict(shapes),
+        )
+    mels = torch.from_numpy(np.stack([b[0] for b in kept]))
+    targets = torch.from_numpy(np.stack([b[1] for b in kept]))
+    weights = torch.from_numpy(np.array([b[2] for b in kept], dtype=np.float32))
     return mels, targets, weights
