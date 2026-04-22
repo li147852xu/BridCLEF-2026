@@ -30,7 +30,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 from common.cloud_paths import CloudCfg, load_cloud_config  # noqa: E402
-from stages import STAGE_ORDER, load_stage                   # noqa: E402
+from stages import ALL_STAGES, STAGE_ORDER, load_stage       # noqa: E402
 from stages._common import (                                 # noqa: E402
     graceful_sigint,
     is_done,
@@ -51,7 +51,7 @@ def _mk_parser() -> argparse.ArgumentParser:
                    help="Show per-stage done/pending state")
 
     pst = sub.add_parser("stage", parents=[common], help="Run a single stage")
-    pst.add_argument("stage", choices=STAGE_ORDER)
+    pst.add_argument("stage", choices=ALL_STAGES)
     pst.add_argument("--fold", type=int, default=None,
                      help="Fold index (for S5/S7). If omitted, run all folds.")
     pst.add_argument("--fresh", action="store_true",
@@ -63,8 +63,8 @@ def _mk_parser() -> argparse.ArgumentParser:
 
     pp = sub.add_parser("pipeline", parents=[common],
                         help="Run multiple stages in order")
-    pp.add_argument("--from", dest="from_stage", choices=STAGE_ORDER, default=STAGE_ORDER[0])
-    pp.add_argument("--to",   dest="to_stage",   choices=STAGE_ORDER, default=STAGE_ORDER[-1])
+    pp.add_argument("--from", dest="from_stage", choices=ALL_STAGES, default=STAGE_ORDER[0])
+    pp.add_argument("--to",   dest="to_stage",   choices=ALL_STAGES, default=STAGE_ORDER[-1])
     pp.add_argument("--fresh", action="store_true",
                     help="Ignore all existing done flags; re-run everything")
 
@@ -83,10 +83,11 @@ def _cmd_status(cfg: CloudCfg) -> int:
     print(f"work_root: {cfg.work_root}")
     print(f"comp_dir:  {cfg.comp_dir}")
     print("stages:")
-    for s in STAGE_ORDER:
+    for s in ALL_STAGES:
         flag = cfg.stage_flag(s)
         state = "DONE" if is_done(flag) else "pending"
-        print(f"  {s}  [{state}]  {flag}")
+        tag = "" if s in STAGE_ORDER else "  (optional, not run by pipeline)"
+        print(f"  {s}  [{state}]  {flag}{tag}")
     return 0
 
 

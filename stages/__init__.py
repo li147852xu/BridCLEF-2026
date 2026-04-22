@@ -15,14 +15,22 @@ from __future__ import annotations
 
 from typing import Callable
 
-STAGE_ORDER = ["S2", "S3", "S5", "S6", "S7", "S9"]
+# Core pipeline order. S3 (Perch v2 CPU teacher pseudo) was originally
+# intended as an auxiliary supervision signal on all train_soundscapes, but
+# downstream stages (S5/S7) don't consume it — they rely on the 708
+# per-window hard labels + iterative pseudo via S6. S3 is also prohibitively
+# slow on CPU (TF 2.20 has no sm_120 kernels so it can't use the 5090 GPU),
+# so we exclude it from the default pipeline. Users who want the Perch
+# pseudo cache can still run `python run.py stage S3 --config ...` manually.
+STAGE_ORDER = ["S2", "S5", "S6", "S7", "S9"]
+ALL_STAGES  = ["S2", "S3", "S5", "S6", "S7", "S9"]
 
 
 def load_stage(name: str) -> Callable:
     """Import a stage module on demand and return its ``run`` function."""
     mod_map = {
         "S2": "stages.s2_prepare_mel",
-        "S3": "stages.s3_perch_pseudo",
+        "S3": "stages.s3_perch_pseudo",   # optional; not in STAGE_ORDER
         "S5": "stages.s5_finetune",
         "S6": "stages.s6_infer_pseudo",
         "S7": "stages.s7_finetune_iter",
