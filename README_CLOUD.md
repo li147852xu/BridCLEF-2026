@@ -216,15 +216,35 @@ python run.py status --config configs/cloud_Y.yaml
 
 ---
 
-## Which stages still need to be written
+## Full pipeline — what each file does
 
-This README + `run.py` + the S2 / S3 scaffold are **batch 1**. Still coming:
+| Module | Role | Resumable? |
+|---|---|---|
+| ``common/cloud_paths.py`` | YAML config loader with ``${a.b}`` interpolation | n/a |
+| ``common/fold_split.py`` | Deterministic GroupKFold by ``site`` | n/a |
+| ``common/augment.py`` | SpecAugment, mixup, cutmix, time-shift, noise | n/a |
+| ``common/models.py`` | timm backbone + 234-class head + Sydorskyy ckpt loader + EMA | n/a |
+| ``common/datasets.py`` | train_audio / soundscape / pseudo datasets (mel cache aware) | n/a |
+| ``common/training.py`` | Trainer w/ AMP, focal BCE, EMA, SWA, atomic ckpt, HF backup | ✓ |
+| ``stages/s2_prepare_mel.py`` | Competition audio → uint8 mel NPZ | per-file ✓ |
+| ``stages/s3_perch_pseudo.py`` | Perch v2 teacher → soft probs per shard | per-shard ✓ |
+| ``stages/s5_finetune.py`` | 5 fold FT on comp data (warm-start from 2025 weights) | per-fold ✓ |
+| ``stages/s6_infer_pseudo.py`` | 5 fold ensemble → sparse pseudo NPZ (pos ≥ 0.9 / neg ≤ 0.05) | n/a (fast) |
+| ``stages/s7_finetune_iter.py`` | Second FT pass with pseudo mixed in (warm-start from S5) | per-fold ✓ |
+| ``stages/s9_export_openvino.py`` | S7 ``.pt`` → ONNX → OpenVINO fp16 IR | per-fold ✓ |
+| ``kaggle_submit/submit_v5.ipynb`` | 5-fold OV + ±1.5s TTA + neighbour smoothing + per-taxon temp | n/a |
+| ``scripts/build_submit_notebook.py`` | Regenerate the submission ipynb from cell templates | n/a |
 
-- [ ] ``stages/s5_finetune.py`` — eca_nfnet_l0 5-fold FT with resume
-- [ ] ``stages/s6_infer_pseudo.py`` — iter-1 pseudo from S5 ensemble
-- [ ] ``stages/s7_finetune_iter.py`` — FT again with pseudo
-- [ ] ``stages/s9_export_openvino.py`` — ONNX → OpenVINO fp16
-- [ ] ``kaggle_submit/submit_v5.ipynb`` — multi-fold OpenVINO + TTA + neighbour smoothing
+## Checkpoint resume guarantees
 
-Batch 2 lands in the same repo shortly. S2 / S3 are already enough to
-exercise the bootstrap + resume machinery end-to-end.
+Every training stage writes ``last.pt`` atomically (``.pt.tmp`` → rename) every
+``save_every_steps`` steps, plus ``epoch_N.pt`` per epoch (top-3 rotated) and
+``best.pt`` on val-AUC improvement. Restart the same ``python run.py stage ...``
+command and the Trainer:
+
+1. Loads model, optimizer, scheduler, AMP scaler, EMA shadow, and SWA state.
+2. Restores Python / numpy / CUDA RNG.
+3. Continues at the same epoch + global step.
+
+Every 30 min a background thread pushes the whole fold directory to the HF
+repo in ``checkpoint.hf_backup.repo_id`` so a nuked VM isn't fatal.
