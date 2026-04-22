@@ -90,21 +90,40 @@ if torch.cuda.is_available():
 PY
 
 # -------- 2. Kaggle credentials --------------------------------------------
+# Kaggle has two auth styles:
+#   (A) new-style access token (KGAT_...) read from KAGGLE_API_TOKEN env var,
+#       supported by kaggle CLI >= 1.8.0 (2.x).
+#   (B) legacy kaggle.json {"username","key"} read from ~/.kaggle/.
+# We prefer (A), fall back to (B) if env KAGGLE_API_TOKEN is empty.
 echo "[2/6] setting up Kaggle credentials..."
 mkdir -p "$HOME/.kaggle"
-if [[ -n "${KAGGLE_USERNAME:-}" && -n "${KAGGLE_KEY:-}" ]]; then
+if [[ -n "${KAGGLE_API_TOKEN:-}" ]]; then
+  echo "       using KAGGLE_API_TOKEN (new-style access token)"
+  # Upgrade CLI if the current one predates 1.8.0 (KGAT tokens need it).
+  python3 -m pip install --quiet --upgrade "kaggle>=1.8.0"
+  # Nuke any stale kaggle.json so the CLI sees only the env var.
+  rm -f "$HOME/.kaggle/kaggle.json"
+elif [[ -n "${KAGGLE_USERNAME:-}" && -n "${KAGGLE_KEY:-}" ]]; then
   cat > "$HOME/.kaggle/kaggle.json" <<EOF
 {"username":"${KAGGLE_USERNAME}","key":"${KAGGLE_KEY}"}
 EOF
   chmod 600 "$HOME/.kaggle/kaggle.json"
-  echo "       wrote ~/.kaggle/kaggle.json from env vars"
+  echo "       wrote ~/.kaggle/kaggle.json from env vars (legacy)"
 elif [[ -f "$HOME/.kaggle/kaggle.json" ]]; then
   chmod 600 "$HOME/.kaggle/kaggle.json"
-  echo "       found existing ~/.kaggle/kaggle.json"
+  echo "       found existing ~/.kaggle/kaggle.json (legacy)"
 else
-  echo "ERROR: no Kaggle credentials. Set KAGGLE_USERNAME + KAGGLE_KEY, or upload kaggle.json to ~/.kaggle/" >&2
+  echo "ERROR: no Kaggle credentials. Set KAGGLE_API_TOKEN (new style) or KAGGLE_USERNAME+KAGGLE_KEY." >&2
   exit 3
 fi
+
+# Sanity: does kaggle auth actually work?
+if ! kaggle competitions list -s birdclef-2026 >/dev/null 2>&1; then
+  echo "ERROR: Kaggle auth failed. Check your token / Accept competition rules at" >&2
+  echo "       https://www.kaggle.com/competitions/birdclef-2026/rules" >&2
+  exit 3
+fi
+echo "       kaggle auth ok"
 
 # -------- 3. HF token -------------------------------------------------------
 if [[ -n "${HF_TOKEN:-}" ]]; then

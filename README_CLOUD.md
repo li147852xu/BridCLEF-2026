@@ -41,9 +41,12 @@ git clone https://github.com/li147852xu/BridCLEF-2026.git
 cd BridCLEF-2026
 
 # 3. export credentials (do NOT commit these)
-export KAGGLE_USERNAME=li147852xu
-export KAGGLE_KEY=<your-kaggle-api-key>
-export HF_TOKEN=<your-hf-token>          # optional, enables ckpt backup
+#    Kaggle: prefer the new-style KGAT_ token from
+#    https://www.kaggle.com/settings → API → Create New Token.
+export KAGGLE_API_TOKEN=KGAT_<your-kaggle-access-token>
+# legacy fallback (if you only have the old-style kaggle.json):
+#   export KAGGLE_USERNAME=<your-username>; export KAGGLE_KEY=<32-char-hex>
+export HF_TOKEN=hf_<your-hf-token>       # optional, enables ckpt backup
 
 # 4. bootstrap (installs deps, downloads data + weights, ~52 GB)
 bash scripts/cloud_bootstrap.sh --config configs/cloud_Y.yaml
