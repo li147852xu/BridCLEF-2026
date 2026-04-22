@@ -165,7 +165,7 @@ checkpoint:
   # the HF web UI.
   hf_backup:
     enable: true
-    repo_id: "li147852xu/birdclef-2026-ckpts"
+    repo_id: "Tiantanghuaxiao/birdclef-2026-ckpts"
     interval_min: 30
     subdir_pattern: "{stage}/{fold}"
 
