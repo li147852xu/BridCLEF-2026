@@ -177,16 +177,32 @@ def _run_one_fold(
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     pin = (device == "cuda")
+
+    def _worker_init(worker_id: int) -> None:
+        # Keep every worker to a single math thread — prevents OMP/MKL/torch
+        # thread fan-out (AutoDL sets OMP_NUM_THREADS=25 globally, which with
+        # persistent_workers + soundfile starves I/O and stalls the loader).
+        import os
+        import torch as _t
+        os.environ["OMP_NUM_THREADS"] = "1"
+        os.environ["MKL_NUM_THREADS"] = "1"
+        os.environ["OPENBLAS_NUM_THREADS"] = "1"
+        _t.set_num_threads(1)
+
+    n_workers = int(cfg.raw.get("s5", {}).get("num_workers", 4))
     train_loader = DataLoader(
         train_ds, batch_size=backbone_cfg["batch_size"],
-        shuffle=True, num_workers=max(2, int(cfg.raw["s2"]["num_workers"])),
+        shuffle=True, num_workers=n_workers,
         pin_memory=pin, drop_last=True, collate_fn=collate,
-        persistent_workers=True,
+        persistent_workers=False,           # fresh workers each epoch -> avoids leaks
+        prefetch_factor=2,
+        worker_init_fn=_worker_init,
     )
     val_loader = DataLoader(
         val_ds, batch_size=backbone_cfg["batch_size"],
         shuffle=False, num_workers=2, pin_memory=pin,
         collate_fn=collate, persistent_workers=False,
+        worker_init_fn=_worker_init,
     )
 
     trainer_cfg = TrainerConfig(
