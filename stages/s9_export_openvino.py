@@ -59,7 +59,15 @@ def _export_one_fold(
     m = build_model(ModelCfg(backbone=backbone_cfg["name"], n_classes=n_classes, in_chans=1))
     state = torch.load(str(ck), map_location="cpu", weights_only=False)
     m.load_state_dict(state["model"])
+
+    # Triple-defensive eval: model.eval() + per-module .train(False) + no_grad
+    # context during export. Without this, eca_nfnet_l0's BN nodes get
+    # exported with training_mode=1 (invalid for OpenVINO's ONNX frontend,
+    # which rejects BN nodes that carry mean/var as variable outputs).
     m.eval()
+    for sub in m.modules():
+        sub.train(False)
+    m.requires_grad_(False)
 
     # Export input: (1, 1, n_mels, T). T is frames-per-5s-window.
     n_frames = int(np.ceil((mel_cfg.sr * mel_cfg.window_seconds) / mel_cfg.hop)) + 1
@@ -68,19 +76,45 @@ def _export_one_fold(
     # Step 1: torch -> ONNX.
     onnx_path = cfg.export_dir / f"fold_{fold}.onnx"
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
-    # Use the dynamo exporter (available from torch 2.2+) since it handles
-    # nfnet's agc without complaint.
     try:
-        torch.onnx.export(
-            m, dummy, str(onnx_path),
-            input_names=["mel"], output_names=["logits"],
-            opset_version=17,
-            dynamic_axes={"mel": {0: "batch"}, "logits": {0: "batch"}},
-        )
+        with torch.no_grad():
+            torch.onnx.export(
+                m, dummy, str(onnx_path),
+                input_names=["mel"], output_names=["logits"],
+                opset_version=17,
+                dynamic_axes={"mel": {0: "batch"}, "logits": {0: "batch"}},
+                training=torch.onnx.TrainingMode.EVAL,
+                do_constant_folding=True,
+            )
     except Exception as e:  # noqa: BLE001 — fall back to dynamo
         log.warning("torch.onnx.export (legacy) failed (%s); retrying with dynamo", e)
-        ep = torch.onnx.export(m, (dummy,), dynamo=True)
+        with torch.no_grad():
+            ep = torch.onnx.export(m, (dummy,), dynamo=True)
         ep.save(str(onnx_path))
+
+    # Post-process: force training_mode=0 on every BN node. Belt-and-
+    # suspenders — some torch versions ignore the TrainingMode.EVAL flag
+    # for modules not in the standard set. OpenVINO rejects training_mode=1.
+    try:
+        import onnx
+        omodel = onnx.load(str(onnx_path))
+        n_fixed = 0
+        for node in omodel.graph.node:
+            if node.op_type == "BatchNormalization":
+                for attr in node.attribute:
+                    if attr.name == "training_mode" and attr.i != 0:
+                        attr.i = 0
+                        n_fixed += 1
+                # Some exports also drop extra outputs (running_mean, running_var)
+                # while keeping training_mode set; trim to a single output.
+                if len(node.output) > 1:
+                    del node.output[1:]
+                    n_fixed += 1
+        if n_fixed:
+            onnx.save(omodel, str(onnx_path))
+            log.info("S9 fold %d: sanitized %d BN training_mode flags in ONNX", fold, n_fixed)
+    except Exception as e:  # noqa: BLE001
+        log.warning("S9 fold %d: BN post-process failed (%s); OpenVINO may reject", fold, e)
 
     log.info("S9 fold %d: ONNX -> %s", fold, onnx_path)
 
