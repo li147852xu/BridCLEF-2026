@@ -1,9 +1,16 @@
 # BirdCLEF+ 2026 — Cloud pipeline (Plan Y)
 
 One-page ops guide for running the whole training + export pipeline on a
-rented **RTX 5090** box (AutoDL / Vast.ai). Target: **PB 0.90 – 0.92** in one
-pass, ~30 GPU-hours, fits into **30 GB system + 50 GB data** AutoDL defaults
-(expand only if you hit a ceiling — see disk budget below).
+rented **RTX 5090** box (AutoDL / Vast.ai). ~30 GPU-hours, fits into
+**30 GB system + 50 GB data** AutoDL defaults.
+
+## Status snapshot (2026-04-23)
+
+- Plan Y fully trained, exported, and submitted to Kaggle.
+- **Public LB = 0.866** (below the 0.90 target; under the `0.883` v2 baseline).
+- Root cause of the gap is identified (**S7 pseudo-label leakage**, see
+  [Known issues](#known-issues--why-plan-y-underperformed) below). Fix
+  scoped for Plan Y.1 / Plan X.
 
 If you want the deep background (why this architecture, how it compares to
 2025 winning solutions, etc.) read [README.md](./README.md) — it's the old
@@ -54,7 +61,12 @@ bash scripts/cloud_bootstrap.sh --config configs/cloud_Y.yaml
 # 5. run everything (resumable; skips stages already marked done)
 python run.py pipeline --config configs/cloud_Y.yaml
 
-# 6. before shutting the instance down
+# 6. bundle for Kaggle (see "Submission workflow" below)
+#    — uses the HF bridge because AutoDL can't reach Kaggle's upload endpoint
+python scripts/build_submit_notebook.py   # regen submit_v5.ipynb
+# ... then run kaggle_submit/hf_to_kaggle_dataset.ipynb from inside Kaggle
+
+# 7. before shutting the instance down
 bash scripts/cloud_shutdown.sh --config configs/cloud_Y.yaml
 ```
 
@@ -120,12 +132,17 @@ AutoDL's data disk expansion is live — add 50 GB more without rebooting.
 
 | ID | Module | Input | Output | ~time on 5090 |
 |----|---|---|---|---|
-| S2 | ``stages.s2_prepare_mel``   | ``train_soundscapes`` OGG                    | uint8 mel-spec NPZ per file   | 0.5 h (CPU-bound) |
-| S3 | ``stages.s3_perch_pseudo``  | ``train_soundscapes`` OGG + Perch v2         | Perch sigmoid probs per shard | 2–3 h (CPU Perch) |
-| S5 | ``stages.s5_finetune``      | mel cache + train.csv + 708 hard labels      | 5 fold ``eca_nfnet_l0`` ckpts | ~10 h (5090 is ~1.5× 4090) |
-| S6 | ``stages.s6_infer_pseudo``  | S5 ensemble + ``train_soundscapes`` mels     | sparse pseudo npz             | 0.5 h |
-| S7 | ``stages.s7_finetune_iter`` | S5 ckpt + S6 pseudo + comp data              | 5 fold FT-iter ckpts          | ~8 h |
-| S9 | ``stages.s9_export_openvino`` | S7 ckpts                                   | ``export/fold_*.xml`` fp16    | 0.5 h |
+| S2 | ``stages.s2_prepare_mel``     | ``train_soundscapes`` OGG                   | uint8 mel-spec NPZ per file   | **2.7 min** (measured) |
+| S5 | ``stages.s5_finetune``        | mel cache + train.csv + 1478 hard labels    | 5 fold ``eca_nfnet_l0`` ckpts | **2.75 h** (measured, incl. recovery) |
+| S6 | ``stages.s6_infer_pseudo``    | S5 ensemble + all soundscape mels           | sparse pseudo npz (127k rows) | **4 min** (measured) |
+| S7 | ``stages.s7_finetune_iter``   | S5 ckpt + S6 pseudo + comp data             | 5 fold FT-iter ckpts          | **6.3 h** (measured) |
+| S9 | ``stages.s9_export_openvino`` | S7 ckpts                                    | ``export/fold_*.xml`` fp16    | **~1 min** (measured) |
+
+**S3 (Perch v2 teacher pseudo) is intentionally excluded** from the default
+pipeline order — TF 2.20 has no Blackwell (sm_120) kernels so it can only
+run on CPU, and none of the downstream stages consume its output anyway. It
+stays importable via ``python run.py stage S3`` if you ever want the Perch
+cache for other experiments.
 
 Each stage is **idempotent**: re-running either skips (done flag set) or
 resumes from the last checkpoint. Lose the box mid-run? Spin a new one,
@@ -235,8 +252,9 @@ python run.py status --config configs/cloud_Y.yaml
 | ``stages/s6_infer_pseudo.py`` | 5 fold ensemble → sparse pseudo NPZ (pos ≥ 0.9 / neg ≤ 0.05) | n/a (fast) |
 | ``stages/s7_finetune_iter.py`` | Second FT pass with pseudo mixed in (warm-start from S5) | per-fold ✓ |
 | ``stages/s9_export_openvino.py`` | S7 ``.pt`` → ONNX → OpenVINO fp16 IR | per-fold ✓ |
-| ``kaggle_submit/submit_v5.ipynb`` | 5-fold OV + ±1.5s TTA + neighbour smoothing + per-taxon temp | n/a |
-| ``scripts/build_submit_notebook.py`` | Regenerate the submission ipynb from cell templates | n/a |
+| ``kaggle_submit/submit_v5.ipynb``       | 5-fold OV + adaptive TTA + neighbour smoothing + per-taxon temp + placeholder CSV | n/a |
+| ``kaggle_submit/hf_to_kaggle_dataset.ipynb`` | HF → Kaggle dataset bridge (run from inside Kaggle) | n/a |
+| ``scripts/build_submit_notebook.py``    | Regenerate ``submit_v5.ipynb`` cells (in-place rewrite) | n/a |
 
 ## Checkpoint resume guarantees
 
@@ -251,3 +269,131 @@ command and the Trainer:
 
 Every 30 min a background thread pushes the whole fold directory to the HF
 repo in ``checkpoint.hf_backup.repo_id`` so a nuked VM isn't fatal.
+
+---
+
+## Submission workflow
+
+Post-S9 the 5 OpenVINO IR files plus ``manifest.json`` and the offline
+``wheels/`` directory go to Kaggle as a dataset. AutoDL CN POPs **cannot
+reach Kaggle's GCS resumable-upload endpoint** (the IP range hosting
+``storage.googleapis.com``'s blob-upload path is unreachable even though
+``www.kaggle.com`` and plain ``storage.googleapis.com`` are both fine), so we
+go through HuggingFace as a bridge:
+
+```
+AutoDL → (network_turbo HF proxy) → HF private repo bundle_y/
+                                         │
+                                         ↓
+                       kaggle_submit/hf_to_kaggle_dataset.ipynb
+                      (runs inside Kaggle, uses Kaggle Secrets HF_TOKEN)
+                                         │
+                                         ↓
+                         Kaggle dataset: <user>/birdclef-2026-bundle-y
+                                         │
+                                         ↓
+                         attach to kaggle_submit/submit_v5.ipynb
+```
+
+**Step by step:**
+
+1. On the 5090 box, bundle artefacts into one folder (e.g.
+   ``/root/autodl-tmp/bridclef/bundle``): ``fold_{0..4}.{xml,bin}``,
+   ``manifest.json``, ``wheels/*.whl`` (openvino + openvino_telemetry + numpy
+   matching the Kaggle runtime Python), plus ``dataset-metadata.json``.
+2. ``hf upload-folder`` that dir into the ckpt HF repo under ``bundle_y/``
+   (the existing backup repo — commit quota is independent of other repos).
+3. On Kaggle, open a fresh notebook and paste the cells of
+   ``kaggle_submit/hf_to_kaggle_dataset.ipynb``. Add ``HF_TOKEN`` as a
+   notebook Secret, set Internet: On, Save & Run All. It
+   ``snapshot_download`` s the bundle, rewrites ``dataset-metadata.json``,
+   then ``kaggle datasets create`` — all from within Kaggle's network so
+   the upload endpoint is reachable.
+4. Open ``kaggle_submit/submit_v5.ipynb`` on Kaggle, attach the competition
+   + the new dataset, Save & Run All, then Submit to competition.
+
+### Submit notebook design (submit_v5.ipynb)
+
+Generated / regenerable via ``python scripts/build_submit_notebook.py``.
+Key defensive patterns (learned the hard way — see git log for the saga):
+
+- **Cell 0** installs **every** wheel in the bundle (not just openvino-\*)
+  so transitive deps like ``openvino_telemetry`` don't silently break the
+  import in Cell 4.
+- **Cell 1** writes a **placeholder all-zero submission.csv immediately**.
+  Any later crash leaves a valid CSV, so the scored result is PB 0.500
+  (random) rather than "Notebook Threw Exception". Also enumerates test
+  files with a 3-tier fallback (``BASE/test_soundscapes``, rglob,
+  stem-scan) and drops to a **dry-run on train_soundscapes[:20]** when
+  editor Save Version commit sees no test files.
+- **Cell 2** builds ``LABEL_PERM`` from ``sample_sub.columns[1:]`` →
+  ``manifest.primary_labels`` indices — never trust column order, always
+  derive a permutation.
+- **Cell 7** runs an **adaptive ETA loop**: probes the first 8 files with
+  1-TTA to learn real per-file cost, then picks the largest TTA set
+  (3/2/1 shifts) that fits in an 86-min budget. Writes ``submission.csv``
+  atomically every 50 files; emergency brake at 88 min.
+
+---
+
+## Known issues — why Plan Y underperformed
+
+### S7 val AUC looked amazing but PB landed at 0.866
+
+S7's in-training val AUC numbers:
+
+| Fold | val rows | S5 best val | S7 best val | jump |
+|---|---|---|---|---|
+| 0 | 78  | 0.7162 | 0.8519 | +0.14 |
+| 1 | 192 | 0.5856 | 0.9459 | **+0.36** |
+| 2 | 992 | 0.7227 | 0.9731 | **+0.25** |
+| 3 | 120 | 0.8673 | 0.9783 | +0.11 |
+| 4 | 96  | 0.7708 | 0.9162 | +0.15 |
+| weighted mean | — | 0.7194 | **0.9599** | +0.24 |
+
+A +0.24 weighted-mean jump purely from one round of self-pseudo is
+**physically implausible**; the real generalisation step should be on the
+order of +0.02 – +0.05. Observed Public LB 0.866 lines up much better
+with the S5-level 0.72 signal than the S7-level 0.96.
+
+**Root cause:** ``stages/s6_infer_pseudo.py`` generates pseudo labels for
+**every** 5 s window of every soundscape file, then
+``stages/s7_finetune_iter.py`` loads **all** of them as training data —
+including windows that are in each fold's val split. Each fold's model
+then trains on S5-ensemble predictions for its own val windows, so at
+val time it sees targets that are almost-identical to its own training
+pseudo targets. Val AUC becomes a memorisation metric.
+
+### Fix (Plan Y.1 — do this before Plan Z)
+
+Patch S6/S7 so that when generating pseudo labels for **fold k**, we
+exclude the windows whose (filename, window_idx) pair falls into fold k's
+val set. Mechanically:
+
+```python
+# s6_infer_pseudo.py: produce a per-fold pseudo file.
+for fold in range(n_folds):
+    val_set = set(build_soundscape_fold_table(...).query("fold == @fold")
+                  .apply(lambda r: (r.filename_stem, r.window_idx), axis=1))
+    # Use ensemble of *other* folds for prediction, and exclude val windows:
+    save(f"pseudo_iter1_excl_fold{fold}.npz", ...)
+
+# s7_finetune_iter.py: fold k loads pseudo_iter1_excl_fold{k}.npz
+```
+
+Expected effect: val AUC numbers drop to honest levels (~0.80 weighted
+mean), **Public LB goes up** by roughly the gap we currently see between
+the fold-2 S5 signal (0.72, val 992 rows) and the current PB (0.866) —
+probably +0.02 – +0.03.
+
+This is a code change of ~50 lines + one S6 + S7 re-run (≈ 7 h GPU).
+Strictly better than adding a second backbone (Plan Z) before fixing
+this, because Plan Z would inherit the same leakage bug.
+
+### Secondary lever (Plan Z)
+
+After Plan Y.1 is in, adding a second backbone
+(``tf_efficientnetv2_s_in21k``, pretrained on the Sydorskyy 2025 bundle
+same as the nfnet) is the next expected +0.02 – +0.03. See
+[README.md](./README.md) historical context section for the comparison
+with BirdCLEF 2025 Nth-place solutions that used a two-backbone stack.

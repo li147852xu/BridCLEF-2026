@@ -1,8 +1,10 @@
-# BirdCLEF+ 2026 — Perch Distillation Pipeline
+# BirdCLEF+ 2026 — Perch Distillation Pipeline (legacy, v2)
 
 端到端的 [BirdCLEF+ 2026](https://www.kaggle.com/competitions/birdclef-2026) (Pantanal, Brazil) 工程实现：本地 Mac (M3/M4, MPS) 训练 + Kaggle CPU 推理。训练生成一个 artifact bundle，Kaggle notebook 加载后跑 Perch + fusion + post-processing。
 
-> **最终战绩 / 状态**：Public LB **0.883 (v2)**。v3 (MLP probe + self-attn) OOF 更高但 PB 倒退到 0.835（site-shift 过拟合）。v4 mel-CNN 因 Kaggle 时限问题所有变体 (3/2/1 seed) 均 Notebook Timeout，未能获得 PB 分数。详见下方[战绩复盘](#战绩复盘)。
+> ⚠️ **此 README 描述的是 v2 Perch-蒸馏方案（Public LB 0.883）**。当前主力是云端 RTX 5090 上的 **Plan Y**（eca_nfnet_l0 5-fold + pseudo-iter + OpenVINO fp16），Public LB = 0.866，正文请看 **[README_CLOUD.md](./README_CLOUD.md)**。下面保留作为历史参考。
+
+> **历史战绩 / 状态（v2 pipeline）**：Public LB **0.883 (v2)**。v3 (MLP probe + self-attn) OOF 更高但 PB 倒退到 0.835（site-shift 过拟合）。v4 mel-CNN 因 Kaggle 时限问题所有变体 (3/2/1 seed) 均 Notebook Timeout，未能获得 PB 分数。详见下方[战绩复盘](#战绩复盘)。
 
 > 👉 **[KAGGLE_NOTES.md](./KAGGLE_NOTES.md)** — Kaggle 平台对接完整参考：比赛信息、平台约束、数据集上传坑、GPU 训练流程、Code Competition 提交、21 个踩坑清单 + 调试命令。查 Kaggle 相关任何问题都看这里。
 
