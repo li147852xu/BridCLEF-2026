@@ -279,6 +279,12 @@ class PseudoWindowDataset(Dataset):
     Stored fields:
         items : np.ndarray, dtype object, each element is (filename, window_idx)
         targets : (N, 234) float16 — clipped to [0,1]
+
+    ``exclude_sites`` (Plan Y.1): drop every pseudo-labelled window whose
+    filename encodes a site in this set. Used by S7 to remove pseudo
+    samples from the *current fold's val sites* so the model never trains
+    on targets derived for its own held-out distribution (the Plan Y
+    post-mortem root cause).
     """
 
     def __init__(
@@ -290,11 +296,36 @@ class PseudoWindowDataset(Dataset):
         specaug: Optional[SpecAugParams] = None,
         weight: float = 1.0,
         train: bool = True,
+        exclude_sites: Optional[set[str]] = None,
     ):
         d = np.load(pseudo_npz, allow_pickle=True)
-        self.files = d["files"]
-        self.window_idx = d["window_idx"].astype(np.int32)
-        self.targets = d["targets"]  # (N, 234) float16
+        files = d["files"]
+        window_idx = d["window_idx"].astype(np.int32)
+        targets = d["targets"]  # (N, 234) float16
+
+        if exclude_sites:
+            from common.filenames import parse_soundscape_filename
+            # Vectorise the site parse by iterating once; filenames are
+            # short strings so pure-Python is fine for ~128k rows.
+            keep = np.ones(len(files), dtype=bool)
+            dropped = 0
+            for i, fname in enumerate(files):
+                site = parse_soundscape_filename(str(fname)).get("site")
+                if site in exclude_sites:
+                    keep[i] = False
+                    dropped += 1
+            files = files[keep]
+            window_idx = window_idx[keep]
+            targets = targets[keep]
+            import logging as _log
+            _log.getLogger("bridclef.pseudo").info(
+                "PseudoWindowDataset: excluded %d / %d windows from sites %s -> %d remain",
+                dropped, len(keep), sorted(exclude_sites), len(files),
+            )
+
+        self.files = files
+        self.window_idx = window_idx
+        self.targets = targets
         self.cache = Path(mel_cache_dir)
         self.mel_cfg = mel_cfg
         self.specaug = specaug

@@ -92,6 +92,13 @@ def _build_datasets(
         raise FileNotFoundError(
             f"S7 requires S6 output: {pseudo_npz}. Run S6 first."
         )
+
+    # Plan Y.1 anti-leak: drop every pseudo window whose site is in this
+    # fold's val split. Without this, S7 trains on S5-ensemble targets
+    # for the exact files / adjacent windows it will validate on — val
+    # AUC becomes memorisation and best.pt selection is biased.
+    val_sites = set(fold_tbl.loc[fold_tbl["fold"] == val_fold, "site"].unique())
+    log.info("S7 fold %d anti-leak: excluding pseudo sites %s", val_fold, sorted(val_sites))
     pseudo_ds = PseudoWindowDataset(
         pseudo_npz=pseudo_npz,
         mel_cache_dir=cfg.mel_cache / "train_soundscapes",
@@ -99,6 +106,7 @@ def _build_datasets(
         specaug=specaug,
         weight=s7["data_mix"]["pseudo_iter1"]["weight"],
         train=True,
+        exclude_sites=val_sites,
     )
     log.info("S7 fold %d sizes: audio=%d hard=%d pseudo=%d",
              val_fold, len(audio_ds), len(hard_ds), len(pseudo_ds))
