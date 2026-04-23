@@ -205,6 +205,46 @@ print(f'>>> placeholder submission.csv written ({len(placeholder)} rows)')
 
 
 CELL_2 = r'''# Cell 2 — manifest, label perm, per-taxon temp/smooth parameters.
+#
+# =========================================================================
+# DIAGNOSTIC VARIANT SELECTOR — edit this string, re-Save Version, re-submit
+# to probe which part of the pipeline is holding PB back. Each variant
+# changes exactly one lever; compare Public LB scores to locate the bug.
+#
+#   'baseline'         — 5-fold S7 ensemble, equal weight, adaptive TTA,
+#                        rank-aware power 0.5. This is the config that
+#                        scored PB 0.866.
+#   'II_drop_fold1'    — drop fold 1 (S5 val 0.5856, suspected outlier).
+#                        If PB goes UP, fold 1 was dragging the ensemble.
+#   'III_val_weighted' — weight folds by their S7 val-set row counts
+#                        (78/192/992/120/96). Gives fold 2 (val 992,
+#                        honest-hardest val) the largest vote.
+#   'IV_force_3tta'    — skip ETA probe, force [0, -1.5, +1.5] shifts.
+#                        If PB goes UP, the adaptive probe was picking
+#                        too few TTA shifts.
+#   'V_power1'         — rank-aware amplify power 1.0 (full file-max
+#                        crush) instead of 0.5. Some 2025 solutions used
+#                        this; may help or hurt depending on class
+#                        sparsity in test.
+# =========================================================================
+VARIANT = 'baseline'
+
+_VARIANTS = {
+    'baseline':         dict(drop_folds=[],  fold_weights=None,                   force_tta=None,          power=0.5),
+    'II_drop_fold1':    dict(drop_folds=[1], fold_weights=None,                   force_tta=None,          power=0.5),
+    'III_val_weighted': dict(drop_folds=[],  fold_weights={0:78, 1:192, 2:992, 3:120, 4:96}, force_tta=None, power=0.5),
+    'IV_force_3tta':    dict(drop_folds=[],  fold_weights=None,                   force_tta=[0.0,-1.5,1.5], power=0.5),
+    'V_power1':         dict(drop_folds=[],  fold_weights=None,                   force_tta=None,          power=1.0),
+}
+assert VARIANT in _VARIANTS, f'unknown VARIANT {VARIANT!r}; valid: {list(_VARIANTS)}'
+_V = _VARIANTS[VARIANT]
+DROP_FOLDS = set(_V['drop_folds'])
+FOLD_WEIGHTS_SPEC = _V['fold_weights']           # None or {fold_idx: weight}
+FORCE_TTA = _V['force_tta']                      # None or list of shift_s
+RANK_AWARE_POWER = _V['power']
+print(f'>>> VARIANT={VARIANT}  drop_folds={sorted(DROP_FOLDS)}  '
+      f'weights={FOLD_WEIGHTS_SPEC}  force_tta={FORCE_TTA}  power={RANK_AWARE_POWER}')
+
 MANIFEST = None
 MEL_CFG = None
 LABEL_PERM = None
@@ -325,7 +365,13 @@ def window_mels(y, shift_samples=0):
 
 
 CELL_4 = r'''# Cell 4 — load OpenVINO fold models (never raise; flip ABORT on failure).
+# Respects the VARIANT selector from Cell 2:
+#   - DROP_FOLDS: skip those fold indices entirely
+#   - FOLD_WEIGHTS_SPEC: if given, build FOLD_WEIGHTS (normalised) in the
+#     order the models were actually loaded, so Cell 5 can do a weighted
+#     average instead of an equal one.
 FOLD_MODELS = []
+FOLD_IDS = []         # fold index matching each entry of FOLD_MODELS
 if not ABORT:
     try:
         import openvino as ov
@@ -335,43 +381,70 @@ if not ABORT:
         for fmeta in MANIFEST['folds']:
             if fmeta.get('skipped'): continue
             if 'ir_xml' not in fmeta: continue
+            fid = fmeta.get('fold')
+            if fid in DROP_FOLDS:
+                print(f'SKIP fold {fid}: dropped by VARIANT={VARIANT}')
+                continue
             xml = BUNDLE / Path(fmeta['ir_xml']).name
             if not xml.exists():
                 alt = BUNDLE / 'export' / xml.name
                 if alt.exists(): xml = alt
             if not xml.exists():
-                print('SKIP fold', fmeta.get('fold'), ':', xml, 'not found')
+                print('SKIP fold', fid, ':', xml, 'not found')
                 continue
             try:
                 comp = core.compile_model(str(xml), 'CPU')
                 FOLD_MODELS.append(comp)
+                FOLD_IDS.append(fid)
                 in_shape = comp.inputs[0].partial_shape
                 out_shape = comp.outputs[0].partial_shape
-                print(f'compiled fold {fmeta.get("fold")} -> in={in_shape}, out={out_shape}')
+                print(f'compiled fold {fid} -> in={in_shape}, out={out_shape}')
             except Exception as e:
                 print('compile FAILED for', xml, ':', e)
     except Exception as e:
         print('OV import/setup FAILED:', type(e).__name__, e)
 
-print(f'loaded {len(FOLD_MODELS)} fold models')
+print(f'loaded {len(FOLD_MODELS)} fold models: {FOLD_IDS}')
 if not FOLD_MODELS:
     print('WARN: no fold models loaded. Placeholder submission.csv will remain.')
     ABORT = True
+
+# Build per-fold weights (normalised to sum to 1) for the weighted ensemble.
+if not ABORT:
+    if FOLD_WEIGHTS_SPEC is None:
+        FOLD_WEIGHTS = np.ones(len(FOLD_MODELS), dtype=np.float32) / len(FOLD_MODELS)
+    else:
+        raw = np.array([float(FOLD_WEIGHTS_SPEC.get(fid, 0.0)) for fid in FOLD_IDS],
+                       dtype=np.float32)
+        if raw.sum() <= 0:
+            print(f'WARN: FOLD_WEIGHTS_SPEC sums to 0 for loaded folds, falling back to equal.')
+            FOLD_WEIGHTS = np.ones(len(FOLD_MODELS), dtype=np.float32) / len(FOLD_MODELS)
+        else:
+            FOLD_WEIGHTS = raw / raw.sum()
+    print('FOLD_WEIGHTS (normalised):', list(zip(FOLD_IDS, [round(float(w), 4) for w in FOLD_WEIGHTS])))
+else:
+    FOLD_WEIGHTS = np.ones(max(len(FOLD_MODELS), 1), dtype=np.float32) / max(len(FOLD_MODELS), 1)
 '''
 
 
 CELL_5 = r'''# Cell 5 — per-file inference: TTA list (shift 0 always first), fold averaging, label permutation.
 # Model input: (12, 1, n_mels, T) batch; model output: (12, 234) logits.
-# We sigmoid, average across folds, then across TTAs.
+# We sigmoid, then apply FOLD_WEIGHTS (set by Cell 4 from the VARIANT),
+# then average across TTAs.
 def _fold_avg_probs(mels_batched):
-    """mels_batched: (12, 1, n_mels, T) -> (12, 234) sigmoid probs in MODEL_LABELS order."""
+    """mels_batched: (12, 1, n_mels, T) -> (12, 234) sigmoid probs in MODEL_LABELS order.
+
+    Per-fold sigmoid outputs are combined with FOLD_WEIGHTS (sums to 1),
+    so an equal-weight ensemble reduces to ``mean``.
+    """
     x = mels_batched.astype(np.float32)
     acc = None
-    for comp in FOLD_MODELS:
+    for i, comp in enumerate(FOLD_MODELS):
         out = comp(x)[comp.outputs[0]]  # (12, 234) logits
         p = 1.0 / (1.0 + np.exp(-out))
-        acc = p if acc is None else acc + p
-    return (acc / len(FOLD_MODELS)).astype(np.float32)
+        contrib = p * float(FOLD_WEIGHTS[i])
+        acc = contrib if acc is None else acc + contrib
+    return acc.astype(np.float32)  # already sums to 1 of weights
 
 def infer_file(path, tta_shifts_s):
     """Return (12, N_CLASSES) probs permuted into PRIMARY_LABELS order, or None on failure."""
@@ -449,7 +522,7 @@ def _write_submission(probs_by_row_id, zero_row):
     os.replace(tmp, OUT)
     return sub
 
-RANK_AWARE_POWER = 0.5  # legacy PB-0.883 sweet spot
+# RANK_AWARE_POWER comes from the VARIANT dict in Cell 2.
 
 def _post_process(probs):
     probs = smooth_neighbours(probs)
@@ -497,7 +570,15 @@ else:
     wall_used = time.time() - _WALL_START
     time_left = TIME_BUDGET_SEC - wall_used
     remaining = n_total - probe_n
-    if remaining <= 0:
+    if FORCE_TTA is not None:
+        # Variant IV etc. — caller forces a specific TTA schedule, skip
+        # budget check (but emergency brake at 88 min still applies).
+        chosen_tta = list(FORCE_TTA)
+        tta_name = f'{len(chosen_tta)}-TTA (VARIANT override)'
+        if good_probe > 0:
+            est_cost = t_per_file_1tta * len(chosen_tta) * remaining / 60
+            print(f'VARIANT override: forced {tta_name}; estimated phase-2 wall = {est_cost:.1f} min')
+    elif remaining <= 0:
         chosen_tta, tta_name = [0.0], '1-TTA (no remaining)'
     elif good_probe == 0:
         # Don't trust the ETA; fall back to the cheapest option.
