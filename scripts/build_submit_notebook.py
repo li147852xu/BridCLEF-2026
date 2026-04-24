@@ -42,6 +42,8 @@ CELL_0 = r'''# Cell 0 — install every wheel in the bundle's wheels/ dir.
 import glob, subprocess, sys, os
 
 _WHEEL_DIR_CANDIDATES = [
+    '/kaggle/input/datasets/tiantanghuaxiao/birdclef-2026-bundle-y1/wheels',
+    '/kaggle/input/birdclef-2026-bundle-y1/wheels',
     '/kaggle/input/datasets/tiantanghuaxiao/birdclef-2026-bundle-y/wheels',
     '/kaggle/input/birdclef-2026-bundle-y/wheels',
     '/kaggle/input/datasets/li147852xu/birdclef-2026/wheels',
@@ -185,6 +187,8 @@ print(f'>>> test_paths count: {len(test_paths)}  dry_run={DRY_RUN}')
 
 # ----- Bundle discovery -----
 BUNDLE_CANDIDATES = [
+    Path('/kaggle/input/datasets/tiantanghuaxiao/birdclef-2026-bundle-y1'),
+    Path('/kaggle/input/birdclef-2026-bundle-y1'),
     Path('/kaggle/input/datasets/tiantanghuaxiao/birdclef-2026-bundle-y'),
     Path('/kaggle/input/birdclef-2026-bundle-y'),
 ]
