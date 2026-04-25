@@ -56,14 +56,18 @@ OV_OK = False
 if WHEEL_DIR is None:
     print('WARN: no wheels/ dir found under any candidate — Cell 4 will try the preinstalled openvino if any.')
 else:
-    all_whl = sorted(glob.glob(f'{WHEEL_DIR}/*.whl'))
-    # Install order: numpy first (ABI base), telemetry, openvino last.
+    # Skip numpy wheels — Kaggle's preinstalled numpy is the one scipy /
+    # sklearn / numpy itself's C extensions were compiled against; replacing
+    # it via --no-deps breaks them ("cannot import name '_center' from
+    # 'numpy._core.umath'"). Only install the OpenVINO bits.
+    all_whl = [w for w in sorted(glob.glob(f'{WHEEL_DIR}/*.whl'))
+               if not os.path.basename(w).lower().startswith('numpy')]
+    # Install order: telemetry first (openvino imports it), then openvino.
     def _sort_key(p: str) -> int:
         name = os.path.basename(p).lower()
-        if name.startswith('numpy'): return 0
-        if 'telemetry' in name: return 1
-        if name.startswith('openvino'): return 2
-        return 3
+        if 'telemetry' in name: return 0
+        if name.startswith('openvino'): return 1
+        return 2
     all_whl.sort(key=_sort_key)
     print('wheels found:', [os.path.basename(w) for w in all_whl])
     for whl in all_whl:

@@ -44,11 +44,13 @@ OUT_NB = REPO / "kaggle_submit" / "submit_v6_hybrid.ipynb"
 CELL_OV_INSTALL = r'''# Cell 1b — Install OpenVINO from our Plan Y.1 bundle (offline, no Internet on submit)
 #
 # We need OpenVINO at runtime to load our 5 fold IR files. The bundle's
-# wheels/ dir was prepared on the AutoDL box and includes:
-#   numpy-2.2.6 (binary-compatible with Kaggle Python 3.12)
-#   openvino_telemetry-2025.2.0
-#   openvino-2024.4.0
-# Install order: numpy → telemetry → openvino so deps resolve cleanly.
+# wheels/ dir contains numpy + openvino_telemetry + openvino, but we
+# DELIBERATELY skip the numpy wheel: Kaggle's preinstalled numpy is the
+# one scipy / sklearn / numpy-itself's C extensions were compiled against,
+# and replacing it via --no-deps breaks them with errors like
+# "cannot import name '_center' from 'numpy._core.umath'". The 0.924
+# notebook needs sklearn (PCA, MLPClassifier) and scipy under the hood,
+# so we install only telemetry + openvino and leave numpy alone.
 import glob, subprocess, sys, os
 
 _OV_WHEEL_DIRS = [
@@ -62,11 +64,15 @@ HYBRID_OV_OK = False
 if _wheel_dir is None:
     print("HYBRID: no OV wheels found; hybrid blend will be skipped (still get 0.924-baseline output).")
 else:
-    _whls = sorted(glob.glob(_wheel_dir + "/*.whl"))
+    # Skip numpy* wheels — Kaggle's preinstalled numpy must NOT be replaced.
+    _whls = [w for w in sorted(glob.glob(_wheel_dir + "/*.whl"))
+             if not os.path.basename(w).lower().startswith("numpy")]
+    # Install order: telemetry first (openvino imports it at top level), then openvino.
     def _ord(p):
         n = os.path.basename(p).lower()
-        return 0 if n.startswith("numpy") else 1 if "telemetry" in n else 2 if n.startswith("openvino") else 3
+        return 0 if "telemetry" in n else 1 if n.startswith("openvino") else 2
     _whls.sort(key=_ord)
+    print("HYBRID wheels to install:", [os.path.basename(w) for w in _whls])
     for _w in _whls:
         try:
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", _w], check=True)
