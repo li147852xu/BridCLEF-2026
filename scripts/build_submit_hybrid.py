@@ -51,7 +51,12 @@ CELL_OV_INSTALL = r'''# Cell 1b — Install OpenVINO from our Plan Y.1 bundle (o
 # "cannot import name '_center' from 'numpy._core.umath'". The 0.924
 # notebook needs sklearn (PCA, MLPClassifier) and scipy under the hood,
 # so we install only telemetry + openvino and leave numpy alone.
-import glob, subprocess, sys, os
+import glob, subprocess, sys, os, time
+
+# Wall-clock anchor for ETA budgeting in the hybrid OV cell later.
+# Submitting Cells 0-1 (TF wheels) already burns ~80s; we measure from here so
+# the OV ETA reflects "time the user has burned since the notebook started".
+_WALL_START = time.time()
 
 _OV_WHEEL_DIRS = [
     "/kaggle/input/datasets/tiantanghuaxiao/birdclef-2026-bundle-y1/wheels",
@@ -88,7 +93,25 @@ else:
 
 
 # Cell inserted right after their per-file Perch inference (their original cell 46)
-CELL_OUR_INFER = r'''# Cell 46b — Plan Y.1 5-fold OpenVINO ensemble on the same test_paths.
+CELL_OUR_INFER = r'''# Cell 46b — Plan Y.1 OpenVINO ensemble on the same test_paths, ETA-aware.
+#
+# Budget context: the 0.924 baseline alone uses ~75 min on a ~500-file test
+# (XLA warmup + Perch per-file + ProtoSSM TTA + post-proc). Our 5-fold OV
+# costs ~5.4 sec/file at the dry-run pace, so adding the full 5 folds
+# blows past 90 min on anything bigger than ~300 files (timeout = 0.5 PB).
+#
+# Two cost knobs:
+#   MAX_FOLDS = 3      load only the top-3 by S7 val_auc (3, 2, 1 — see below)
+#   WALL_BUDGET_S      hard wall-clock ceiling; if even probing predicts an
+#                      overshoot, we skip OV entirely and degrade to the
+#                      pure 0.924 baseline (HYBRID_W blend becomes a no-op).
+#
+# Per-file probe: time the first 5 files, extrapolate, decide whether to
+# run the full set, run a partial set, or bail. Inside the loop we also
+# check wall clock every 50 files and abort early if we are about to bust.
+#
+# Output: ``our_probs_test`` (n_windows, N_CLASSES) PRIMARY_LABELS-ordered,
+# or None if we couldn't fit any inference in the remaining budget.
 #
 # Output: ``our_probs_test`` of shape (n_windows, N_CLASSES) in PRIMARY_LABELS
 # order, where ``n_windows = len(test_paths) * N_WINDOWS``. Order matches
@@ -104,8 +127,25 @@ import time, json
 from pathlib import Path
 import numpy as np
 
+# ---- Budget knobs (tune here) ----
+MAX_FOLDS_OV = 3               # load at most N folds (top by val_auc); cuts cost ~40% vs 5
+WALL_BUDGET_S = 78 * 60        # leave 12 min cushion below the 90-min Kaggle cap
+PROBE_N_OV = 5                 # files to probe for ETA estimation
+HARD_ABORT_WALL_S = 82 * 60    # mid-loop abort threshold
+
+# IMPORTANT: this cell relies on _WALL_START set in cell 1b. If it isn't set
+# we make a fresh one — ETA is then conservative (overestimates remaining).
+try:
+    _WALL_T0 = _WALL_START
+except NameError:
+    _WALL_T0 = time.time()
+
 our_probs_test = None
 HYBRID_BUNDLE = None
+
+# Top-3 folds by S7 val_auc (post-Plan-Y.1, val-size weighted): fold 3 (0.96),
+# fold 2 (0.954), fold 1 (0.951). Drops fold 0 (val=78, noisy) and fold 4.
+PREFERRED_FOLDS = [3, 2, 1, 4, 0]
 
 if not HYBRID_OV_OK:
     print("HYBRID skipped: OV not loaded.")
@@ -118,6 +158,12 @@ else:
     ]
     HYBRID_BUNDLE = next((p for p in _BUNDLES if (p / "manifest.json").exists()), None)
     print("HYBRID bundle:", HYBRID_BUNDLE)
+    _wall_now = time.time() - _WALL_T0
+    if _wall_now > WALL_BUDGET_S * 0.7:
+        # Already burned too much (Perch probably took longer than estimated).
+        print(f"HYBRID early-skip: wall={_wall_now/60:.1f}min already > 70% of budget; "
+              f"degrading to 0.924 baseline.")
+        HYBRID_BUNDLE = None
 
 if HYBRID_OV_OK and HYBRID_BUNDLE is not None:
     with open(HYBRID_BUNDLE / "manifest.json") as _f:
@@ -166,13 +212,19 @@ if HYBRID_OV_OK and HYBRID_BUNDLE is not None:
         OUR_FB = _build_mel_fb(_MEL["sr"], _MEL["n_fft"], _MEL["n_mels"], _MEL["f_min"], _MEL["f_max"])
         OUR_TARGET_T = int(np.ceil(_MEL["sr"] * _MEL["window_seconds"] / _MEL["hop"])) + 1
 
-        # ----- compile fold IRs -----
+        # ----- compile fold IRs (only the top MAX_FOLDS_OV by PREFERRED_FOLDS order) -----
         import openvino as ov
         _core = ov.Core()
         _core.set_property("CPU", {"INFERENCE_NUM_THREADS": 4})
+
+        _by_fold = {int(f.get("fold", -1)): f for f in _MAN["folds"]
+                    if not f.get("skipped") and "ir_xml" in f}
+        _ordered = [_by_fold[i] for i in PREFERRED_FOLDS if i in _by_fold]
+        _to_load = _ordered[:MAX_FOLDS_OV]
+        print(f"HYBRID will load folds: {[f['fold'] for f in _to_load]} (max={MAX_FOLDS_OV})")
+
         FOLD_OV = []
-        for _fmeta in _MAN["folds"]:
-            if _fmeta.get("skipped") or "ir_xml" not in _fmeta: continue
+        for _fmeta in _to_load:
             _xml = HYBRID_BUNDLE / Path(_fmeta["ir_xml"]).name
             if not _xml.exists():
                 _alt = HYBRID_BUNDLE / "export" / _xml.name
@@ -218,23 +270,58 @@ if HYBRID_OV_OK and HYBRID_BUNDLE is not None:
                     acc = _p if acc is None else acc + _p
                 return (acc / len(FOLD_OV))
 
-            _t0 = time.time()
+            # ---- ETA probe: time first PROBE_N_OV files at this fold count ----
+            _n_total = len(test_paths)
+            _probe_n = min(PROBE_N_OV, _n_total)
+            _t_probe = time.time()
             _per_file = []
-            for _i, _p in enumerate(test_paths):
-                try:
-                    _pp = _our_infer_one(_p)
+            for _i in range(_probe_n):
+                try: _pp = _our_infer_one(test_paths[_i])
                 except Exception as _e:
-                    print("HYBRID our_infer fail @", _p.name, ":", type(_e).__name__, _e)
+                    print("HYBRID probe fail @", test_paths[_i].name, ":", type(_e).__name__, _e)
                     _pp = np.zeros((_NW, len(_OUR_LABELS)), dtype=np.float32)
                 _per_file.append(_pp[:, LABEL_PERM_OUR])
-                if (_i + 1) % 50 == 0:
-                    _wall = (time.time() - _t0) / 60
-                    _eta = _wall / (_i + 1) * (len(test_paths) - _i - 1)
-                    print(f"HYBRID our infer {_i+1}/{len(test_paths)}  wall={_wall:.1f}min  eta={_eta:.1f}min")
-            our_probs_test = np.concatenate(_per_file, axis=0).astype(np.float32)
-            print(f"HYBRID our_probs_test shape: {our_probs_test.shape}  "
-                  f"range: {our_probs_test.min():.4f}..{our_probs_test.max():.4f}  "
-                  f"wall: {(time.time()-_t0)/60:.1f}min")
+            _probe_dt = time.time() - _t_probe
+            _per_file_s = _probe_dt / max(1, _probe_n)
+            _wall_now = time.time() - _WALL_T0
+            _proj_wall = _wall_now + _per_file_s * (_n_total - _probe_n)
+            print(f"HYBRID probe: {_probe_n} files in {_probe_dt:.1f}s "
+                  f"({_per_file_s:.2f}s/file); wall={_wall_now/60:.1f}min "
+                  f"projected_total={_proj_wall/60:.1f}min "
+                  f"(budget={WALL_BUDGET_S/60:.0f}min)")
+
+            if _proj_wall > WALL_BUDGET_S:
+                # Projected to bust budget -> bail out, blend stays a no-op.
+                print("HYBRID BAIL: projection exceeds budget; skipping rest of OV. "
+                      "Final submission will be the 0.924 baseline only.")
+                # Don't set our_probs_test (stays None) -> blend skipped.
+            else:
+                # ---- Phase 2: full loop, with mid-loop wall guard ----
+                _t_loop = time.time()
+                _aborted = False
+                for _i in range(_probe_n, _n_total):
+                    _wall = time.time() - _WALL_T0
+                    if _wall > HARD_ABORT_WALL_S:
+                        # Out of time. Stop. We will NOT publish a partial blend
+                        # (mismatched shape would crash the assert downstream),
+                        # so just bail: leave our_probs_test = None.
+                        print(f"HYBRID HARD ABORT @ file {_i}/{_n_total}, wall={_wall/60:.1f}min")
+                        _aborted = True
+                        break
+                    try: _pp = _our_infer_one(test_paths[_i])
+                    except Exception as _e:
+                        print("HYBRID infer fail @", test_paths[_i].name, ":", type(_e).__name__, _e)
+                        _pp = np.zeros((_NW, len(_OUR_LABELS)), dtype=np.float32)
+                    _per_file.append(_pp[:, LABEL_PERM_OUR])
+                    if (_i + 1) % 50 == 0:
+                        _w = (time.time() - _WALL_T0) / 60
+                        _e_left = (_n_total - _i - 1) * _per_file_s / 60
+                        print(f"HYBRID OV {_i+1}/{_n_total}  wall={_w:.1f}min  eta_remaining={_e_left:.1f}min")
+                if not _aborted:
+                    our_probs_test = np.concatenate(_per_file, axis=0).astype(np.float32)
+                    print(f"HYBRID our_probs_test shape: {our_probs_test.shape}  "
+                          f"range: {our_probs_test.min():.4f}..{our_probs_test.max():.4f}  "
+                          f"total_wall: {(time.time()-_WALL_T0)/60:.1f}min")
 '''
 
 
