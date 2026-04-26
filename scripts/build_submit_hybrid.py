@@ -377,30 +377,69 @@ if HYBRID_OV_OK and HYBRID_BUNDLE is not None:
 #     information optimally.
 BLEND_SNIPPET = '''
 
-# --- HYBRID: rank-average late fusion with our Plan Y.1 ensemble ---
-# Inserted RIGHT BEFORE submission build, AFTER all of the upstream
-# post-proc (file-level confidence, rank-aware scaling, delta smooth,
-# per-class thresholds). We blend in *rank space*, not probability
-# space, because macro ROC-AUC is fundamentally rank-based: per-class
-# we replace each row's probability with its column-wise rank in (0,1],
-# weighted-average across the two models, and write the blended ranks
-# back as the final probs. This is calibration-free and preserves both
-# models' ranking info optimally for the AUC metric.
-#
-# Tune HYBRID_W lower if our predictions look noisier than theirs
-# (PB drops). 0.30 is a balanced starting point; the previous 0.40
-# probability-space blend cost us 0.004 PB.
+# === HYBRID Phase-1 tuning knobs (edit these in Kaggle UI to A/B) =========
+# All three knobs are independent. Effective weight per (row, class) is:
+#   w_class = PER_TAXON_W[class_taxon] if PER_TAXON_W else HYBRID_W
+# Then blend method = BLEND_MODE picks how their probs vs ours combine.
 HYBRID_W = 0.30
+# Set PER_TAXON_W = None to use the scalar above; set to a dict to use
+# per-taxon weights (good when our model is stronger on one taxon than
+# another). Class taxa come from CLASS_NAME_MAP set in cell 11.
+# Example tuned guess:
+#   PER_TAXON_W = {"Aves": 0.25, "Amphibia": 0.35, "Insecta": 0.40,
+#                  "Mammalia": 0.30, "Reptilia": 0.30}
+PER_TAXON_W = None
+# 'rank_arith'  : per-class column ranks, weighted arithmetic mean (default)
+# 'rank_geo'    : per-class column ranks, weighted GEOMETRIC mean
+#                 (sharper on tails; helps when one model is confident wrong)
+# 'prob_arith'  : the v2 probability-space arithmetic mean (loses to rank;
+#                 only useful if you want to roll back to v2 behaviour)
+BLEND_MODE = 'rank_arith'
+# ==========================================================================
+
 try:
     if our_probs_test is not None and our_probs_test.shape == probs.shape:
-        from scipy.stats import rankdata as _rankdata
-        _n = probs.shape[0]
-        # rankdata along axis=0 (per class column); average ties.
-        _their_r = _rankdata(probs, axis=0).astype(np.float32) / _n
-        _our_r   = _rankdata(our_probs_test.astype(np.float32), axis=0).astype(np.float32) / _n
-        _blended = (1.0 - HYBRID_W) * _their_r + HYBRID_W * _our_r
+        # Build per-class weight vector w_vec of shape (N_CLASSES,)
+        if PER_TAXON_W is not None:
+            try:
+                w_vec = np.array([
+                    float(PER_TAXON_W.get(CLASS_NAME_MAP.get(lbl, "Aves"), HYBRID_W))
+                    for lbl in PRIMARY_LABELS
+                ], dtype=np.float32)
+                _w_summary = {k: float(v) for k, v in PER_TAXON_W.items()}
+            except Exception as _e:
+                print(f"HYBRID PER_TAXON_W failed ({_e}); falling back to scalar HYBRID_W={HYBRID_W}")
+                w_vec = np.full(N_CLASSES, HYBRID_W, dtype=np.float32)
+                _w_summary = {"scalar": HYBRID_W}
+        else:
+            w_vec = np.full(N_CLASSES, HYBRID_W, dtype=np.float32)
+            _w_summary = {"scalar": HYBRID_W}
+        # Broadcast to (1, N_CLASSES) for elementwise blend.
+        w_ours = w_vec[None, :]
+        w_them = 1.0 - w_ours
+
+        if BLEND_MODE in ('rank_arith', 'rank_geo'):
+            from scipy.stats import rankdata as _rankdata
+            _n = probs.shape[0]
+            _their_r = _rankdata(probs, axis=0).astype(np.float32) / _n
+            _our_r   = _rankdata(our_probs_test.astype(np.float32), axis=0).astype(np.float32) / _n
+            if BLEND_MODE == 'rank_arith':
+                _blended = w_them * _their_r + w_ours * _our_r
+            else:  # rank_geo
+                _eps = 1e-9
+                _blended = np.exp(w_them * np.log(_their_r + _eps) + w_ours * np.log(_our_r + _eps))
+        elif BLEND_MODE == 'prob_arith':
+            _blended = w_them * probs + w_ours * our_probs_test.astype(np.float32)
+        else:
+            print(f"HYBRID unknown BLEND_MODE={BLEND_MODE!r}; defaulting to rank_arith.")
+            from scipy.stats import rankdata as _rankdata
+            _n = probs.shape[0]
+            _their_r = _rankdata(probs, axis=0).astype(np.float32) / _n
+            _our_r   = _rankdata(our_probs_test.astype(np.float32), axis=0).astype(np.float32) / _n
+            _blended = w_them * _their_r + w_ours * _our_r
+
         probs = np.clip(_blended, 0.0, 1.0).astype(np.float32)
-        print(f"HYBRID rank-blended (w_ours={HYBRID_W}, w_theirs={1-HYBRID_W}) "
+        print(f"HYBRID blended  mode={BLEND_MODE!r}  weights={_w_summary}  "
               f"after their full post-proc chain.")
     else:
         print(f"HYBRID skipped at blend: our_probs_test="
