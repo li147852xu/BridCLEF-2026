@@ -37,7 +37,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SOURCE_NB = REPO / "legacy" / "notebooks" / "pantanal-distill-birdclef2026-improvement-a4dc68.ipynb"
-OUT_NB = REPO / "kaggle_submit" / "submit_v6_hybrid.ipynb"
+# Canonical hybrid output = the W=0.30 / rank_arith Phase-1 experiment A1.
+# Variants A0, A2, A3, B, C, D are derived from this file by
+# scripts/build_phase1_experiments.py.
+OUT_NB = REPO / "kaggle_submit" / "20_hybrid_phase1" / "exp_A1_W030_rank_arith.ipynb"
 
 
 # Cell inserted right after their TF 2.20 install (becomes cell index 2 in the new nb)
