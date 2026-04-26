@@ -365,22 +365,47 @@ if HYBRID_OV_OK and HYBRID_BUNDLE is not None:
 '''
 
 
-# Snippet inserted into cell 50 right after `probs = sigmoid(scaled_scores)`
+# Snippet inserted into cell 50 right BEFORE `# --- Build submission ---`
+# (i.e. after ALL of their post-proc has finished). Two design changes vs v1:
+#   * blend AT THE VERY END so the open-source notebook's per-class threshold,
+#     rank-aware, file-level scale, delta smooth chain runs untouched on their
+#     own probabilities (it was tuned for their distribution). v1 blended right
+#     after sigmoid which detuned that chain and cost us ~0.004 PB.
+#   * rank-average instead of probability-average. Kaggle macro AUC is rank-
+#     based so calibration mismatch between the two models doesn't matter; only
+#     within-column ordering does. Rank-blend preserves both models' ranking
+#     information optimally.
 BLEND_SNIPPET = '''
 
-# --- HYBRID: late fusion with our 5-fold OpenVINO ensemble (Plan Y.1) ---
-# We blend in probability space (after sigmoid, before their rank-aware /
-# delta-smooth / per-class threshold pipeline). If hybrid prep failed,
-# `our_probs_test` is None and this is a no-op — we keep the 0.924 baseline.
-HYBRID_W = 0.4   # weight for our CNN; their stack gets 1 - HYBRID_W
+# --- HYBRID: rank-average late fusion with our Plan Y.1 ensemble ---
+# Inserted RIGHT BEFORE submission build, AFTER all of the upstream
+# post-proc (file-level confidence, rank-aware scaling, delta smooth,
+# per-class thresholds). We blend in *rank space*, not probability
+# space, because macro ROC-AUC is fundamentally rank-based: per-class
+# we replace each row's probability with its column-wise rank in (0,1],
+# weighted-average across the two models, and write the blended ranks
+# back as the final probs. This is calibration-free and preserves both
+# models' ranking info optimally for the AUC metric.
+#
+# Tune HYBRID_W lower if our predictions look noisier than theirs
+# (PB drops). 0.30 is a balanced starting point; the previous 0.40
+# probability-space blend cost us 0.004 PB.
+HYBRID_W = 0.30
 try:
     if our_probs_test is not None and our_probs_test.shape == probs.shape:
-        probs = (1.0 - HYBRID_W) * probs + HYBRID_W * our_probs_test.astype(np.float32)
-        probs = np.clip(probs, 0.0, 1.0)
-        print(f"HYBRID blended probs (w_ours={HYBRID_W}, w_theirs={1-HYBRID_W})")
+        from scipy.stats import rankdata as _rankdata
+        _n = probs.shape[0]
+        # rankdata along axis=0 (per class column); average ties.
+        _their_r = _rankdata(probs, axis=0).astype(np.float32) / _n
+        _our_r   = _rankdata(our_probs_test.astype(np.float32), axis=0).astype(np.float32) / _n
+        _blended = (1.0 - HYBRID_W) * _their_r + HYBRID_W * _our_r
+        probs = np.clip(_blended, 0.0, 1.0).astype(np.float32)
+        print(f"HYBRID rank-blended (w_ours={HYBRID_W}, w_theirs={1-HYBRID_W}) "
+              f"after their full post-proc chain.")
     else:
-        print(f"HYBRID skipped at blend: our_probs_test = {None if our_probs_test is None else our_probs_test.shape}, "
-              f"theirs = {probs.shape}")
+        print(f"HYBRID skipped at blend: our_probs_test="
+              f"{None if our_probs_test is None else our_probs_test.shape}, "
+              f"theirs={probs.shape} -- pure 0.924 baseline output stands.")
 except NameError:
     print("HYBRID skipped at blend: our_probs_test not defined (cell 46b errored).")
 '''
@@ -390,9 +415,11 @@ def main() -> None:
     nb = json.loads(SOURCE_NB.read_text())
 
     # Sanity: original cell 50 must still contain the line we anchor against.
+    # We insert AFTER the post-proc chain (right before submission build) so
+    # the open-source notebook's tuned post-proc runs on its own probs only.
     cell_50 = nb["cells"][50]
     src_50 = "".join(cell_50["source"]) if isinstance(cell_50["source"], list) else cell_50["source"]
-    anchor = "probs = sigmoid(scaled_scores)"
+    anchor = "# --- Build submission ---"
     if anchor not in src_50:
         raise SystemExit(f"Sanity fail: anchor {anchor!r} not in cell 50 of source notebook.")
 
@@ -402,12 +429,13 @@ def main() -> None:
     nb["cells"].insert(2, _new_code_cell(CELL_OV_INSTALL))
 
     # Modify the blend in what was originally cell 50 (now shifted by +2 → cell 52).
+    # Insert BEFORE the anchor so our blend runs after all post-proc finishes.
     target_idx = 52
     cell_target = nb["cells"][target_idx]
     src = "".join(cell_target["source"]) if isinstance(cell_target["source"], list) else cell_target["source"]
     if anchor not in src:
         raise SystemExit(f"Anchor missing after shift; expected at cell {target_idx}.")
-    new_src = src.replace(anchor, anchor + BLEND_SNIPPET, 1)
+    new_src = src.replace(anchor, BLEND_SNIPPET + anchor, 1)
     cell_target["source"] = new_src.splitlines(keepends=True)
     cell_target["outputs"] = []
     cell_target["execution_count"] = None
