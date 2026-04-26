@@ -93,25 +93,31 @@ else:
 
 
 # Cell inserted right after their per-file Perch inference (their original cell 46)
-CELL_OUR_INFER = r'''# Cell 46b — Plan Y.1 OpenVINO ensemble on the same test_paths, ETA-aware.
+CELL_OUR_INFER = r'''# Cell 46b — Plan Y.1 OpenVINO ensemble, file-batched + adaptively-degraded.
 #
-# Budget context: the 0.924 baseline alone uses ~75 min on a ~500-file test
-# (XLA warmup + Perch per-file + ProtoSSM TTA + post-proc). Our 5-fold OV
-# costs ~5.4 sec/file at the dry-run pace, so adding the full 5 folds
-# blows past 90 min on anything bigger than ~300 files (timeout = 0.5 PB).
+# Goal: extract maximum signal from our 5 folds within the 90-min Kaggle cap.
+# Two performance levers and one safety net.
 #
-# Two cost knobs:
-#   MAX_FOLDS = 3      load only the top-3 by S7 val_auc (3, 2, 1 — see below)
-#   WALL_BUDGET_S      hard wall-clock ceiling; if even probing predicts an
-#                      overshoot, we skip OV entirely and degrade to the
-#                      pure 0.924 baseline (HYBRID_W blend becomes a no-op).
+# Lever 1 — file-batching (BATCH_FILES = 4):
+#   Decode + mel-spec ``BATCH_FILES`` files at a time, then run ONE forward
+#   per fold on (BATCH_FILES * 12, 1, 128, T). OpenVINO amortises Python
+#   overhead and parallelises across the bigger batch -> ~1.7x speedup vs
+#   per-file forwards.
 #
-# Per-file probe: time the first 5 files, extrapolate, decide whether to
-# run the full set, run a partial set, or bail. Inside the loop we also
-# check wall clock every 50 files and abort early if we are about to bust.
+# Lever 2 — adaptive fold count (5 → 3 → 1):
+#   Compile all 5 folds upfront. Probe with the chosen fold count on the
+#   first PROBE_BATCHES batches; project remaining wall. If projection >
+#   budget, drop fold count down the FOLD_LADDER and re-probe. Only bail
+#   to baseline when even a single fold cannot fit. We keep MAXIMUM
+#   diversity at every level rather than pre-cutting.
+#
+# Safety net — mid-loop wall guard (HARD_ABORT_WALL_S):
+#   Inside the file loop, if wall clock crosses the abort threshold, stop
+#   producing OV. If we have full coverage, blend; otherwise bail to
+#   baseline (no partial blend — would crash the shape assert downstream).
 #
 # Output: ``our_probs_test`` (n_windows, N_CLASSES) PRIMARY_LABELS-ordered,
-# or None if we couldn't fit any inference in the remaining budget.
+# or None if budget pressure forced a full bail.
 #
 # Output: ``our_probs_test`` of shape (n_windows, N_CLASSES) in PRIMARY_LABELS
 # order, where ``n_windows = len(test_paths) * N_WINDOWS``. Order matches
@@ -127,14 +133,18 @@ import time, json
 from pathlib import Path
 import numpy as np
 
-# ---- Budget knobs (tune here) ----
-MAX_FOLDS_OV = 3               # load at most N folds (top by val_auc); cuts cost ~40% vs 5
-WALL_BUDGET_S = 78 * 60        # leave 12 min cushion below the 90-min Kaggle cap
-PROBE_N_OV = 5                 # files to probe for ETA estimation
-HARD_ABORT_WALL_S = 82 * 60    # mid-loop abort threshold
+# ---- Performance knobs ----
+BATCH_FILES = 4                # OV forward batch = BATCH_FILES * 12 windows
+PROBE_BATCHES = 2              # probe this many batches for ETA
+WALL_BUDGET_S = 80 * 60        # 10-min cushion under 90-min Kaggle cap
+HARD_ABORT_WALL_S = 84 * 60    # mid-loop abort threshold
 
-# IMPORTANT: this cell relies on _WALL_START set in cell 1b. If it isn't set
-# we make a fresh one — ETA is then conservative (overestimates remaining).
+# Adaptive fold ladder: if 5 folds won't fit, drop to 3, then 1; only bail
+# (HYBRID_W → no-op) if even 1 fold can't fit. Order within each level
+# picks the most-trusted folds first (S7 val_auc descending: 3, 2, 1, 4, 0).
+FOLD_PRIORITY = [3, 2, 1, 4, 0]
+FOLD_LADDER = [5, 3, 1]
+
 try:
     _WALL_T0 = _WALL_START
 except NameError:
@@ -142,10 +152,6 @@ except NameError:
 
 our_probs_test = None
 HYBRID_BUNDLE = None
-
-# Top-3 folds by S7 val_auc (post-Plan-Y.1, val-size weighted): fold 3 (0.96),
-# fold 2 (0.954), fold 1 (0.951). Drops fold 0 (val=78, noisy) and fold 4.
-PREFERRED_FOLDS = [3, 2, 1, 4, 0]
 
 if not HYBRID_OV_OK:
     print("HYBRID skipped: OV not loaded.")
@@ -212,33 +218,31 @@ if HYBRID_OV_OK and HYBRID_BUNDLE is not None:
         OUR_FB = _build_mel_fb(_MEL["sr"], _MEL["n_fft"], _MEL["n_mels"], _MEL["f_min"], _MEL["f_max"])
         OUR_TARGET_T = int(np.ceil(_MEL["sr"] * _MEL["window_seconds"] / _MEL["hop"])) + 1
 
-        # ----- compile fold IRs (only the top MAX_FOLDS_OV by PREFERRED_FOLDS order) -----
+        # ----- compile ALL available folds upfront (cheap, ~5-10s total) -----
         import openvino as ov
         _core = ov.Core()
         _core.set_property("CPU", {"INFERENCE_NUM_THREADS": 4})
 
         _by_fold = {int(f.get("fold", -1)): f for f in _MAN["folds"]
                     if not f.get("skipped") and "ir_xml" in f}
-        _ordered = [_by_fold[i] for i in PREFERRED_FOLDS if i in _by_fold]
-        _to_load = _ordered[:MAX_FOLDS_OV]
-        print(f"HYBRID will load folds: {[f['fold'] for f in _to_load]} (max={MAX_FOLDS_OV})")
-
-        FOLD_OV = []
-        for _fmeta in _to_load:
+        ALL_FOLD_OV = {}   # fold_idx -> compiled_model
+        for _i in FOLD_PRIORITY:
+            _fmeta = _by_fold.get(_i)
+            if _fmeta is None: continue
             _xml = HYBRID_BUNDLE / Path(_fmeta["ir_xml"]).name
             if not _xml.exists():
                 _alt = HYBRID_BUNDLE / "export" / _xml.name
                 if _alt.exists(): _xml = _alt
             if not _xml.exists():
-                print("HYBRID skip fold", _fmeta.get("fold"), "— xml missing")
-                continue
+                print("HYBRID skip fold", _i, "— xml missing"); continue
             try:
-                FOLD_OV.append(_core.compile_model(str(_xml), "CPU"))
+                ALL_FOLD_OV[_i] = _core.compile_model(str(_xml), "CPU")
             except Exception as _e:
-                print("HYBRID compile fail", _xml, ":", _e)
-        print(f"HYBRID compiled {len(FOLD_OV)} fold models")
+                print("HYBRID compile fail fold", _i, ":", _e)
+        _avail_folds = [i for i in FOLD_PRIORITY if i in ALL_FOLD_OV]
+        print(f"HYBRID compiled folds {_avail_folds} (out of {FOLD_PRIORITY})")
 
-        if FOLD_OV:
+        if _avail_folds:
             import soundfile as sf
             _SR = _MEL["sr"]; _NW = _MEL["windows_per_file"]; _WS = _MEL["window_seconds"]
             _WANT = _SR * _WS * _NW
@@ -250,7 +254,7 @@ if HYBRID_OV_OK and HYBRID_BUNDLE is not None:
                 elif len(y) > _WANT: y = y[:_WANT]
                 return y
 
-            def _our_infer_one(p):
+            def _mel_for_one(p):
                 y = _decode_60s(p)
                 w = y.reshape(_NW, _SR * _WS)
                 mels = np.stack([
@@ -262,65 +266,101 @@ if HYBRID_OV_OK and HYBRID_BUNDLE is not None:
                     mels = np.pad(mels, ((0,0),(0,0),(0, OUR_TARGET_T - mels.shape[-1])), mode="edge")
                 elif mels.shape[-1] > OUR_TARGET_T:
                     mels = mels[..., :OUR_TARGET_T]
-                x = mels[:, None, :, :].astype(np.float32)
+                return mels[:, None, :, :].astype(np.float32)  # (12, 1, 128, T)
+
+            def _our_infer_batch(paths, fold_subset):
+                """Decode + mel-spec all paths, then ONE forward per fold on the
+                stacked (N*12, 1, 128, T) tensor. Returns (N*12, 234) probs avg."""
+                mels_per_file = [_mel_for_one(p) for p in paths]
+                x = np.concatenate(mels_per_file, axis=0)
                 acc = None
-                for _c in FOLD_OV:
+                for _f in fold_subset:
+                    _c = ALL_FOLD_OV[_f]
                     _o = _c(x)[_c.outputs[0]]
                     _p = 1.0 / (1.0 + np.exp(-_o))
                     acc = _p if acc is None else acc + _p
-                return (acc / len(FOLD_OV))
+                return acc / len(fold_subset)  # (N*12, 234)
 
-            # ---- ETA probe: time first PROBE_N_OV files at this fold count ----
             _n_total = len(test_paths)
-            _probe_n = min(PROBE_N_OV, _n_total)
-            _t_probe = time.time()
-            _per_file = []
-            for _i in range(_probe_n):
-                try: _pp = _our_infer_one(test_paths[_i])
-                except Exception as _e:
-                    print("HYBRID probe fail @", test_paths[_i].name, ":", type(_e).__name__, _e)
-                    _pp = np.zeros((_NW, len(_OUR_LABELS)), dtype=np.float32)
-                _per_file.append(_pp[:, LABEL_PERM_OUR])
-            _probe_dt = time.time() - _t_probe
-            _per_file_s = _probe_dt / max(1, _probe_n)
-            _wall_now = time.time() - _WALL_T0
-            _proj_wall = _wall_now + _per_file_s * (_n_total - _probe_n)
-            print(f"HYBRID probe: {_probe_n} files in {_probe_dt:.1f}s "
-                  f"({_per_file_s:.2f}s/file); wall={_wall_now/60:.1f}min "
-                  f"projected_total={_proj_wall/60:.1f}min "
-                  f"(budget={WALL_BUDGET_S/60:.0f}min)")
 
-            if _proj_wall > WALL_BUDGET_S:
-                # Projected to bust budget -> bail out, blend stays a no-op.
-                print("HYBRID BAIL: projection exceeds budget; skipping rest of OV. "
-                      "Final submission will be the 0.924 baseline only.")
-                # Don't set our_probs_test (stays None) -> blend skipped.
+            # ---- Adaptive probe ladder: pick the largest fold count that fits ----
+            chosen_folds = None
+            per_file_s = None
+            _probe_files_n = min(BATCH_FILES * PROBE_BATCHES, _n_total)
+            _probe_paths = list(test_paths[:_probe_files_n])
+
+            for _n_folds in FOLD_LADDER:
+                if _n_folds > len(_avail_folds): continue
+                _subset = _avail_folds[:_n_folds]
+                _t_probe = time.time()
+                # Probe in real batches (so per-file s reflects batch amortisation)
+                for _b0 in range(0, _probe_files_n, BATCH_FILES):
+                    _bp = _probe_paths[_b0:_b0 + BATCH_FILES]
+                    try: _ = _our_infer_batch(_bp, _subset)
+                    except Exception as _e:
+                        print(f"HYBRID probe-{_n_folds}f fail:", type(_e).__name__, _e)
+                        _ = None
+                _probe_dt = time.time() - _t_probe
+                _pf = _probe_dt / max(1, _probe_files_n)
+                _wall = time.time() - _WALL_T0
+                _proj = _wall + _pf * (_n_total - _probe_files_n)
+                print(f"HYBRID probe folds={_n_folds} files={_probe_files_n} "
+                      f"in {_probe_dt:.1f}s ({_pf:.2f}s/file)  wall={_wall/60:.1f}min "
+                      f"projected={_proj/60:.1f}min budget={WALL_BUDGET_S/60:.0f}min")
+                if _proj <= WALL_BUDGET_S:
+                    chosen_folds = _subset
+                    per_file_s = _pf
+                    print(f"HYBRID CHOSEN: folds={chosen_folds} (max from ladder that fits)")
+                    break
+                else:
+                    print(f"HYBRID dropping from {_n_folds} folds — over budget")
+
+            if chosen_folds is None:
+                print("HYBRID BAIL: even 1 fold cannot fit. Falling back to 0.924 baseline.")
             else:
-                # ---- Phase 2: full loop, with mid-loop wall guard ----
-                _t_loop = time.time()
+                # ---- Full batched run with mid-loop wall guard ----
+                _per_file_probs = []
+                # Probe outputs already computed above but discarded; redo the
+                # probe range with the chosen fold subset to keep its results.
+                for _b0 in range(0, _probe_files_n, BATCH_FILES):
+                    _bp = _probe_paths[_b0:_b0 + BATCH_FILES]
+                    try:
+                        _out = _our_infer_batch(_bp, chosen_folds)  # (N*12, 234)
+                        _per_file_probs.append(_out.reshape(len(_bp), _NW, -1)[:, :, LABEL_PERM_OUR])
+                    except Exception as _e:
+                        print("HYBRID re-probe fail:", _e)
+                        for _ in _bp:
+                            _per_file_probs.append(np.zeros((1, _NW, N_CLASSES), dtype=np.float32))
+
                 _aborted = False
-                for _i in range(_probe_n, _n_total):
+                for _b0 in range(_probe_files_n, _n_total, BATCH_FILES):
                     _wall = time.time() - _WALL_T0
                     if _wall > HARD_ABORT_WALL_S:
-                        # Out of time. Stop. We will NOT publish a partial blend
-                        # (mismatched shape would crash the assert downstream),
-                        # so just bail: leave our_probs_test = None.
-                        print(f"HYBRID HARD ABORT @ file {_i}/{_n_total}, wall={_wall/60:.1f}min")
+                        print(f"HYBRID HARD ABORT @ file {_b0}/{_n_total}, wall={_wall/60:.1f}min")
                         _aborted = True
                         break
-                    try: _pp = _our_infer_one(test_paths[_i])
+                    _bp = list(test_paths[_b0:_b0 + BATCH_FILES])
+                    try:
+                        _out = _our_infer_batch(_bp, chosen_folds)
+                        _per_file_probs.append(_out.reshape(len(_bp), _NW, -1)[:, :, LABEL_PERM_OUR])
                     except Exception as _e:
-                        print("HYBRID infer fail @", test_paths[_i].name, ":", type(_e).__name__, _e)
-                        _pp = np.zeros((_NW, len(_OUR_LABELS)), dtype=np.float32)
-                    _per_file.append(_pp[:, LABEL_PERM_OUR])
-                    if (_i + 1) % 50 == 0:
+                        print("HYBRID infer batch fail:", type(_e).__name__, _e)
+                        _per_file_probs.append(np.zeros((len(_bp), _NW, N_CLASSES), dtype=np.float32))
+                    if ((_b0 // BATCH_FILES) + 1) % 25 == 0:
                         _w = (time.time() - _WALL_T0) / 60
-                        _e_left = (_n_total - _i - 1) * _per_file_s / 60
-                        print(f"HYBRID OV {_i+1}/{_n_total}  wall={_w:.1f}min  eta_remaining={_e_left:.1f}min")
+                        _done = _b0 + len(_bp)
+                        _eta = (_n_total - _done) * per_file_s / 60
+                        print(f"HYBRID OV {_done}/{_n_total} files (folds={len(chosen_folds)}) "
+                              f"wall={_w:.1f}min eta_remaining={_eta:.1f}min")
+
                 if not _aborted:
-                    our_probs_test = np.concatenate(_per_file, axis=0).astype(np.float32)
+                    # stack: list of (n_b, 12, 234) -> (sum_n_b * 12, 234)
+                    our_probs_test = np.concatenate(
+                        [a.reshape(-1, N_CLASSES) for a in _per_file_probs], axis=0
+                    ).astype(np.float32)
                     print(f"HYBRID our_probs_test shape: {our_probs_test.shape}  "
                           f"range: {our_probs_test.min():.4f}..{our_probs_test.max():.4f}  "
+                          f"folds_used={len(chosen_folds)}  "
                           f"total_wall: {(time.time()-_WALL_T0)/60:.1f}min")
 '''
 
