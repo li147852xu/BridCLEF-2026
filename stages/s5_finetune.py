@@ -74,8 +74,19 @@ def _pick_pretrained(pretrain_dir: Path, backbone: str) -> Optional[Path]:
     matches = [p for p in cand if key in p.stem.replace("_", "").lower()]
     if not matches:
         return None
-    # Prefer 2025 models, then shorter stem (less suffix noise).
-    matches.sort(key=lambda p: (0 if "2025" in str(p) else 1, len(p.stem)))
+    # Prefer 2025 models — but check the IMMEDIATE parent dir, not the full
+    # path. The pretrain_dir itself contains 'birdclef_2025_pretrained' so a
+    # naive substring match on str(p) was true for both year subdirs and the
+    # tiebreaker leaked into stem-length, picking the shorter (and weaker)
+    # 2024 ckpt over the SWA-finalised 2025 one.
+    def _year_key(p: Path) -> int:
+        for parent in p.parents:
+            if parent.name == "models_2025":
+                return 0
+            if parent.name == "models_2024":
+                return 1
+        return 2
+    matches.sort(key=lambda p: (_year_key(p), len(p.stem)))
     return matches[0]
 
 
