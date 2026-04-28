@@ -1,0 +1,178 @@
+# BirdCLEF+ 2026 — Plan Z (cloud, second backbone for ensemble diversity)
+# Target: train tf_efficientnetv2_s alongside our existing eca_nfnet_l0 (Y),
+# then ensemble both bundles in the submit notebook → +0.005-0.015 PB from
+# real model-family diversity (EfficientNetV2 attention/SE patterns vs
+# NFNet's normalizer-free residuals).
+#
+# Pipeline parity with Y: same data, same mel spec, same 5-fold splits,
+# same iter-pseudo recipe (S2 → S5 → S6 → S7 → S9). Only the backbone
+# differs. So this YAML is a near-clone of cloud_Y.yaml with these deltas:
+#   * backbones[0].name        eca_nfnet_l0 → tf_efficientnetv2_s.in21k_ft_in1k
+#   * backbones[0].head_dropout  0.20 → 0.30 (EfficientNetV2 likes more dropout)
+#   * paths.{ckpt_root,export_dir,logs_dir,flags_dir}: *_z suffix so Z
+#     artefacts never collide with Y's. Mel cache + Perch cache + comp
+#     data + Sydorskyy 2025 weights stay SHARED — those are backbone-
+#     agnostic and saving the 30-min S2 rebuild is real money.
+#   * S6's pseudo_iter1.npz is hardcoded under ${work_root}/artifacts/pseudo/
+#     and WILL overwrite Y's pseudo cache. That's fine: Y is done (bundle_y1
+#     already shipped to HF + Kaggle), and Z's S7 reads what Z's S6 just
+#     wrote. If you ever want to re-run Y, re-run Y's S6 to regenerate.
+
+plan: Z
+backbones:
+  - name: tf_efficientnetv2_s.in21k_ft_in1k     # timm slug; in21k pretrain → in1k FT head
+    lr: 5.0e-4               # same as Y; EfficientNetV2 is happy in 3e-4..1e-3 range
+    batch_size: 64           # 5090 32GB; effv2_s ≈ 22M params, similar VRAM to nfnet_l0
+    epochs_ft: 18
+    epochs_ft_iter: 12
+    head_dropout: 0.30       # EfficientNetV2 typically wants slightly more head dropout
+
+paths:
+  work_root: /root/autodl-tmp/bridclef        # SAME as Y; Z artefacts live in *_z subdirs
+  repo_root: /root/BridCLEF-2026
+
+  # -- inputs (downloaded once by Y's bootstrap; reused as-is) -------------
+  comp_dir:      ${paths.work_root}/data/birdclef-2026
+  perch_model:   ${paths.work_root}/weights/perch_v2_cpu/1
+  pretrain_dir:  ${paths.work_root}/weights/birdclef_2025_pretrained
+
+  # -- caches (SHARED with Y — backbone-agnostic) ---------------------------
+  # S2 will scan-and-skip if cache already complete (idempotent on n_windows).
+  mel_cache:     ${paths.work_root}/cache/mel
+  perch_cache:   ${paths.work_root}/cache/perch                   # unused (S3 disabled)
+
+  # -- Z-specific outputs (won't collide with Y) ----------------------------
+  ckpt_root:     ${paths.work_root}/checkpoints_z                 # S5/S7 outputs
+  export_dir:    ${paths.work_root}/export_z                      # S9 OV IR
+  logs_dir:      ${paths.work_root}/logs_z
+
+  # Z-specific done flags so the pipeline runs from scratch even though Y's
+  # flags exist. (Mel cache will still skip-confirm; that step takes ~30s.)
+  flags_dir:     ${paths.work_root}/.flags_z
+
+audio:
+  sample_rate: 32000
+  window_seconds: 5
+  file_seconds: 60
+  windows_per_file: 12
+
+mel:
+  n_fft: 1024
+  hop_length: 512
+  win_length: 1024
+  n_mels: 128
+  f_min: 50
+  f_max: 16000
+  power: 2.0
+  normalized: false
+  db_clip:  [-80.0, 0.0]
+
+s2:
+  sources:
+    - name: train_soundscapes
+      glob: train_soundscapes/*.ogg
+  num_workers: 8
+
+s3:
+  # Same as Y: included in config for completeness but NOT in default
+  # STAGE_ORDER. Run manually if you ever need the Perch pseudo cache.
+  input_source: train_soundscapes
+  batch_files: 32
+  device: cpu
+  output_shards: 4
+  ckpt_every_files: 50
+
+s5:
+  n_folds: 5
+  fold_by: site
+  data_mix:
+    train_audio:
+      weight: 1.0
+      label: weak
+      secondary_soft: 0.3
+    train_soundscapes_labels:
+      weight: 3.0
+      label: hard
+  loss:
+    type: focal_bce
+    gamma: 2.0
+    label_smoothing: 0.02
+  augment:
+    spec_augment:
+      freq_masks: 2
+      freq_mask_param: 16
+      time_masks: 2
+      time_mask_param: 40
+    mixup_alpha: 0.4
+    mixup_prob: 0.5
+    cutmix_prob: 0.3
+    time_shift_max_s: 1.0
+  optimizer:
+    name: adamw
+    weight_decay: 1.0e-2
+  scheduler:
+    name: cosine
+    warmup_epochs: 2
+  ema_decay: 0.9995
+  swa:
+    enable: true
+    last_epochs: 5
+  save_every_steps: 500
+  eval_every_epochs: 1
+  amp: true
+  num_workers: 2
+
+s6:
+  tta:
+    - {shift_s: 0.0}
+    - {shift_s: -1.5}
+    - {shift_s:  1.5}
+  pos_threshold: 0.90
+  neg_threshold: 0.05
+  save_format: sparse_npz
+
+s7:
+  inherit: s5
+  data_mix:
+    train_audio:
+      weight: 1.0
+      label: weak
+      secondary_soft: 0.3
+    train_soundscapes_labels:
+      weight: 3.0
+      label: hard
+    pseudo_iter1:
+      weight: 1.0
+      label: pseudo
+  epochs_ft_iter: 12
+  lr_multiplier: 0.5
+
+s9:
+  precision: fp16
+  input_shape: [1, 160000]
+  per_fold: true
+  sanity_test: true
+
+checkpoint:
+  keep_last_n: 3
+  keep_best: true
+  atomic_write: true
+  save_rng: true
+  hf_backup:
+    enable: true
+    repo_id: "Tiantanghuaxiao/birdclef-2026-ckpts"
+    interval_min: 30
+    # Backup goes under bundle_y2/{stage}/{fold}/ in HF so Y's bundle_y1/
+    # tree stays intact and we can attribute checkpoints to the right plan.
+    subdir_pattern: "bundle_y2/{stage}/{fold}"
+
+log:
+  level: INFO
+  jsonl: true
+  tensorboard: true
+  console_every_steps: 50
+
+misc:
+  seed: 20260428                # different seed than Y so init randomness is independent
+  deterministic: false
+  num_workers_io: 4
