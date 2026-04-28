@@ -51,9 +51,17 @@ def _build_label_index(comp_dir: Path) -> tuple[list[str], dict[str, int]]:
 def _pick_pretrained(pretrain_dir: Path, backbone: str) -> Optional[Path]:
     """Find a pretrained checkpoint in the Sydorskyy 2025 dataset matching ``backbone``.
 
-    Strict: returns ``None`` (not a random fallback) if no filename contains
-    the backbone token — otherwise we'd load an unrelated architecture's
-    weights and wreck init. Prefers files under ``models_2025/`` over
+    Strict-on-architecture: matches ONLY the architecture family token
+    (the part before any timm dot-suffix), since Sydorskyy filenames
+    don't carry timm tags (``in21k_ft_in1k``, etc.). For example,
+    ``tf_efficientnetv2_s.in21k_ft_in1k`` and ``tf_efficientnetv2_s.in21k``
+    both match a Sydorskyy file named
+    ``tf_efficientnetv2_s_in21k_pretrain_from_bigXCV2Ext_swa.ckpt``,
+    while ``eca_nfnet_l0`` (no suffix) keeps its original behaviour.
+
+    Returns ``None`` if no filename contains the architecture token —
+    we never fall back to an unrelated arch's weights, which would
+    silently wreck init. Prefers files under ``models_2025/`` over
     ``models_2024/`` since 2025 was trained with a similar task setup.
     """
     if not pretrain_dir.exists():
@@ -61,11 +69,12 @@ def _pick_pretrained(pretrain_dir: Path, backbone: str) -> Optional[Path]:
     cand: list[Path] = []
     for ext in ("*.ckpt", "*.pt", "*.pth"):
         cand.extend(pretrain_dir.rglob(ext))
-    key = backbone.replace("_", "").lower()
+    arch = backbone.split(".", 1)[0]                       # 'tf_efficientnetv2_s'
+    key = arch.replace("_", "").lower()                    # 'tfefficientnetv2s'
     matches = [p for p in cand if key in p.stem.replace("_", "").lower()]
     if not matches:
         return None
-    # Prefer 2025 models.
+    # Prefer 2025 models, then shorter stem (less suffix noise).
     matches.sort(key=lambda p: (0 if "2025" in str(p) else 1, len(p.stem)))
     return matches[0]
 
